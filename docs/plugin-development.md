@@ -99,7 +99,7 @@ def availability() -> tuple[bool, str]:
 | --- | --- | --- |
 | `change_pct` | **小数制**, `0.0366` = 3.66% | 接口给百分数(3.66)时必须在 provider 内显式 /100 |
 | `turnover_rate`(realtime 入口) | **小数制**, `0.05` = 5% | 下游 enriched 管道统一转百分数值存储 |
-| `volume` | 股 | |
+| `volume` | **手**, `436231` = 43,623,100 股 | 日K 与实时快照均以手计(1手=100股), 股票/ETF/指数一致(与上游 TickFlow 口径一致, 可用 amount÷volume÷100≈当日均价自验); 接口给股时必须在 provider 内显式 /100(参考 fuyao) |
 | `amount` / `turnover` | 元 | |
 | 日K OHLC | **不复权原始价** | 复权由 adj_factor + enriched 管道处理, provider 不得自行复权 |
 
@@ -141,13 +141,17 @@ class MyProvider:
                   on_chunk_done=None) -> pl.DataFrame:
         """日K: [symbol, date, open, high, low, close, volume, amount]; 不复权"""
 
+    def iter_daily(self, symbols, start_time, end_time, asset_type="stock",
+                   on_chunk_done=None) -> Iterator[pl.DataFrame]:
+        """(可选)有界分批返回与 get_daily 同形的日K; 全市场历史同步优先消费。"""
+
     def get_adj_factors(self, symbols, start_time, end_time, asset_type="stock",
                         on_chunk_done=None) -> pl.DataFrame:
         """除权因子: [symbol, trade_date, ex_factor]"""
 
     def get_minute(self, symbols, start_time, end_time, asset_type="stock",
                    on_chunk_done=None, freq="1m") -> pl.DataFrame:
-        """分钟K: [symbol, datetime(北京墙钟), open, high, low, close, volume, amount]"""
+        """分钟K: [symbol, datetime(北京墙钟), open, high, low, close, volume, amount(元, 可空)]"""
 
     def get_intraday_batch(self, symbols, count=300, asset_type="stock") -> pl.DataFrame:
         """(声明 full_minute 数据集时实现) 全量分钟修复轮: 给定标的当日 1 分钟K,
@@ -204,6 +208,9 @@ provider 不应自行切换或回退到其他数据源。
 （09:30–11:30 / 13:00–15:00）映射每根K线，UTC 口径的帧会导致全部点位落在时轴外、
 分时图空白。
 
+`amount` 单位为元；数据源无法提供可靠的分钟成交额时应返回 `null`，不得伪造。
+成交额缺失后无法继续计算累计成交均价，前端会停止绘制后续均价线并显示 `—`。
+
 入口守卫（`kline_sync._enforce_minute_beijing_wallclock`）对所有分钟源强制归一：
 带时区 → 自动换算成北京墙钟；naive 但整体呈 UTC 特征（如 01:30）→ 自动 +8 纠偏并
 记日志；完全无法识别的口径 → 拒收并回退 TickFlow。契约仍要求源头写对，守卫只是兜底。
@@ -241,6 +248,12 @@ provider 不应自行切换或回退到其他数据源。
 | `get_depth_batch` | 单批异常由服务隔离并保留其他批次; 不跨数据源回退 |
 | `get_minute` | 抛异常时调用方自动回退 TickFlow 重试 |
 | `get_daily` / `get_adj_factors` / `get_financials` | 异常由上层同步流程捕获记录; 无数据返回空 DataFrame |
+| `iter_daily` | 可选; 每批必须符合 `get_daily` 契约。流正常结束后才提交 staging; 未捕获异常会丢弃 staging。provider 内已定义的单标的软失败语义保持不变 |
+
+`iter_daily` 用于避免大范围日K同步在 provider 内累积完整 DataFrame。实现该方法后,
+`kline_sync` 会优先消费它; 未实现的 provider 继续调用 `get_daily`,保持兼容。批次大小应有
+明确上界,不得先把全部结果放入列表再 `concat`。`on_chunk_done(cur, total)` 必须覆盖空批次,
+确保最终 `cur == total`。
 
 ### get_realtime 行字段
 
@@ -250,7 +263,7 @@ provider 不应自行切换或回退到其他数据源。
 | `last_price` | ✅ | 最新价 |
 | `prev_close` | ✅ | 昨收, 涨跌幅推导基准 |
 | `open` / `high` / `low` | ✅ | 当日 OHLC |
-| `volume` | ✅ | 股 |
+| `volume` | ✅ | **手**(1手=100股) |
 | `amount` | 建议 | 成交额(元) |
 | `change_pct` | 建议 | **小数制**; 缺失时下游按 change_amount/prev_close 推导 |
 | `change_amount` | 建议 | 涨跌额(元) |
