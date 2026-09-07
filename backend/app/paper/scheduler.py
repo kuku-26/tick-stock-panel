@@ -3,6 +3,10 @@
   - fetch_job:  在策略 fetch_time（默认 09:25）拉取问财选股并落盘
   - simulate_job: 在策略 simulate_time（默认 15:30）结算当日行情
 
+结算依赖当日 enriched 日线(盘后管道落盘, 默认 15:35 才开始跑), 因此
+simulate_time 建议不早于盘后管道完成时间; 行情未就绪时本次结算跳过,
+不自动重试。
+
 调度失败只记录日志，绝不破坏主程序；单个策略故障不影响其它策略。
 """
 from __future__ import annotations
@@ -14,7 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from . import context
 from .market import MarketData
-from .service import run_fetch, run_simulate
+from .service import MarketDataNotReadyError, run_fetch, run_simulate
 from .store import PaperStore
 
 logger = logging.getLogger(__name__)
@@ -35,15 +39,19 @@ def _fetch(strategy_id: str) -> None:
         logger.exception("paper fetch %s failed: %s", strategy_id, e)
 
 
-def _simulate(strategy_id: str) -> None:
+def _simulate(strategy_id: str, date_str: str | None = None) -> None:
+    """结算一个策略; 行情未就绪时记录告警并跳过本次结算(不重试)。"""
     try:
         store = context.get_store()
         strategy = store.load_strategies().get(strategy_id)
         if strategy is None or not strategy.enabled:
             logger.info("paper simulate %s: 策略不存在或未启用, 跳过", strategy_id)
             return
-        result = run_simulate(store, context.get_market(), strategy)
+        result = run_simulate(store, context.get_market(), strategy, date_str)
         logger.info("paper simulate %s: %s", strategy_id, result)
+    except MarketDataNotReadyError as e:
+        logger.warning("paper simulate %s: 行情数据未就绪, 本次结算跳过: %s",
+                       strategy_id, e)
     except Exception as e:
         logger.exception("paper simulate %s failed: %s", strategy_id, e)
 
@@ -76,14 +84,14 @@ class PaperScheduler:
 
     # ── 内部 ────────────────────────────────────────────
     def _schedule_all(self) -> None:
-        # 移除旧的 paper_* job，重新按当前策略注册（幂等）
+        strategies = self._store.load_strategies()
+        # 移除旧的 paper_* cron job 后按当前策略重注册(幂等)。
         for job in self._sched.get_jobs():
             if job.id.startswith("paper_"):
                 try:
                     self._sched.remove_job(job.id)
                 except Exception:
                     pass
-        strategies = self._store.load_strategies()
         for sid, s in strategies.items():
             if not s.enabled:
                 continue

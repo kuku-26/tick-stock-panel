@@ -107,7 +107,7 @@ class FakeMarket:
         self.rows = rows
         self.limit_up = {}
 
-    def day_rows(self, date):
+    def day_rows(self, date, signal_ids=None):
         return self.rows.get(date, {})
 
     def symbol_limit_up(self, symbol):

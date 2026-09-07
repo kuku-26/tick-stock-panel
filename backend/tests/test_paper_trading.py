@@ -6,9 +6,13 @@ import dataclasses
 
 import pytest
 
+from app.paper import context
 from app.paper.market import DayRow
 from app.paper.models import (Account, BuyRule, PaperStrategy, SellRule,
                               LOT, Position)
+from app.paper.scheduler import PaperScheduler, _simulate
+from app.paper.service import MarketDataNotReadyError, run_simulate
+from app.paper.store import PaperStore
 from app.paper.trading import decide_exit, entry_signal_passes, process_day
 
 
@@ -18,8 +22,10 @@ class FakeMarket:
     def __init__(self, rows=None, limit_up=None):
         self.rows = rows or {}
         self.limit_up = limit_up or {}
+        self.day_rows_calls: list[tuple[str, tuple[str, ...]]] = []
 
-    def day_rows(self, date: str):
+    def day_rows(self, date: str, signal_ids=None):
+        self.day_rows_calls.append((date, tuple(sorted(signal_ids or ()))))
         return self.rows.get(date, {})
 
     def symbol_limit_up(self, symbol: str):
@@ -350,3 +356,76 @@ def test_buy_same_open_position_minus_marketvalue_nextopen_differs():
     s.buy_rule = BuyRule.from_dict({"buy_time": "same_open", "max_position_pct": 0.5})
     _, snap = process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
     assert round(snap.market_value, 2) == 5000 * 12, "持仓市值应按收盘价评估"
+
+
+# ── 结算数据就绪检查（run_simulate） ─────────────────────
+
+
+def _seed_store(tmp_path) -> PaperStore:
+    store = PaperStore(tmp_path)
+    store.save_accounts({"acc1": Account.create("acc1", "测试账户", 100000.0)})
+    store.save_strategies({"strat1": PaperStrategy.create("strat1", "策略", "acc1", "query")})
+    return store
+
+
+def test_run_simulate_raises_when_day_rows_missing(tmp_path):
+    """当日 enriched 未落盘：明确报错且不落任何结算产物（fail-closed）。"""
+    store = _seed_store(tmp_path)
+    s = store.load_strategies()["strat1"]
+    with pytest.raises(MarketDataNotReadyError, match="尚未就绪"):
+        run_simulate(store, FakeMarket({}), s, "2026-01-02")
+    assert store.list_day_dates("strat1") == [], "未就绪时不应写日快照"
+    assert store.load_trades("strat1") == []
+    assert store.load_accounts()["acc1"].cash == 100000.0
+
+
+def test_run_simulate_ok_when_day_rows_ready(tmp_path):
+    store = _seed_store(tmp_path)
+    s = store.load_strategies()["strat1"]
+    mk = FakeMarket({"2026-01-02": {"000001": r("000001", 10, 11)}})
+    result = run_simulate(store, mk, s, "2026-01-02",
+                          fallback_candidates=["000001"])
+    assert result["date"] == "2026-01-02"
+    assert store.list_day_dates("strat1") == ["2026-01-02"]
+
+
+# ── 调度器：结算未就绪跳过 / 就绪正常结算 ────────────────
+
+
+def test_simulate_skips_when_data_not_ready(tmp_path):
+    """数据未就绪时不抛异常、不落任何结算产物(调度器仅记告警)。"""
+    store = _seed_store(tmp_path)
+    mk = FakeMarket({})  # 当日无行情
+    sched = PaperScheduler(store, mk)
+    context.set_instances(store, mk, sched)
+    sched.start()
+    try:
+        _simulate("strat1", date_str="2026-01-02")  # 不应抛出
+        assert store.list_day_dates("strat1") == [], "未就绪时不应写日快照"
+        assert store.load_trades("strat1") == []
+    finally:
+        sched.stop()
+
+
+def test_simulate_settles_when_data_ready(tmp_path):
+    store = _seed_store(tmp_path)
+    mk = FakeMarket({"2026-01-02": {"000001": r("000001", 10, 11)}})
+    sched = PaperScheduler(store, mk)
+    context.set_instances(store, mk, sched)
+    sched.start()
+    try:
+        _simulate("strat1", date_str="2026-01-02")
+        assert store.list_day_dates("strat1") == ["2026-01-02"]
+    finally:
+        sched.stop()
+
+
+def test_process_day_passes_strategy_signals_to_market():
+    """process_day 应把策略买卖规则引用的信号集传给 day_rows（按需计算 csg 列）。"""
+    mk = FakeMarket({"2026-01-02": {"000001": r("000001", 10, 10)}})
+    acct = make_account()
+    s = make_strategy()
+    s.buy_rule.signal_ids = ["sig_a"]
+    s.sell_rule.exit_signal_ids = ["out_b"]
+    process_day(mk, acct, s, "2026-01-02", candidates=[])
+    assert mk.day_rows_calls == [("2026-01-02", ("out_b", "sig_a"))]
