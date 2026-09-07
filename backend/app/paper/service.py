@@ -10,9 +10,13 @@ from . import iwencai_service
 from .market import MarketData
 from .models import Account, PaperStrategy
 from .store import PaperStore
-from .trading import process_day
+from .trading import process_day, strategy_signal_ids
 
 logger = logging.getLogger(__name__)
+
+
+class MarketDataNotReadyError(RuntimeError):
+    """结算日 enriched 日线尚未落盘(盘后管道未完成), 无法定价。"""
 
 
 def resolve_api_key(strategy: PaperStrategy) -> str:
@@ -39,12 +43,19 @@ def run_simulate(store: PaperStore, market: MarketData, strategy: PaperStrategy,
     """结算一个交易日：读当日问财候选 + 账户 → 模拟成交 → 落盘。
 
     当天未拉问到财快照时，可传入 fallback_candidates（如手动指定）。
+    结算日 enriched 日线未落盘时抛 MarketDataNotReadyError(盘后管道未完成,
+    静默空结算会掩盖"结算没生效"的问题)。
     """
     date_str = date_str or date.today().isoformat()
     accounts = store.load_accounts()
     account = accounts.get(strategy.account_id)
     if account is None:
         raise RuntimeError(f"策略 {strategy.name} 绑定的账户不存在: {strategy.account_id}")
+
+    if not market.day_rows(date_str, strategy_signal_ids(strategy)):
+        raise MarketDataNotReadyError(
+            f"{date_str} 的行情数据尚未就绪（盘后管道未完成落盘），无法结算；"
+            "请等待盘后管道完成后再试")
 
     candidates = fallback_candidates
     iwencai_rows: dict | None = None

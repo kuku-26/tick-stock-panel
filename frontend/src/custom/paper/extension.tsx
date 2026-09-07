@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { LineChart, Wallet, Save, Trash2, RefreshCw, Play, Settings2, Loader2, Plus, Pencil } from 'lucide-react'
+import { LineChart, Wallet, Save, Trash2, RefreshCw, Play, Settings2, Loader2, Plus, Pencil, History } from 'lucide-react'
 import type { FrontendExtension } from '@/extensions/types'
 import { paperApi, type Account, type AccountDay, type AccountDetail, type FieldOption, type ManualTrade, type PaperStrategy, type SignalOption, type SnapshotSheet } from './api'
 
@@ -377,21 +377,9 @@ function AccountDetailPanel({ detail, onEdit, onManualTrade }: {
   )
 }
 
-function SnapshotSheetModal({ strategyId, name, onClose }: {
-  strategyId: string
-  name: string
-  onClose: () => void
-}) {
-  const [data, setData] = useState<SnapshotSheet | null>(null)
-  const [err, setErr] = useState('')
+function SnapshotTable({ data }: { data: SnapshotSheet | null }) {
   const [sort, setSort] = useState<{ col: string; dir: 'asc' | 'desc' } | null>(null)
-  useEffect(() => {
-    let alive = true
-    paperApi.snapshot(strategyId)
-      .then(d => { if (alive) { setData(d); setSort(null) } })
-      .catch(e => alive && setErr(String(e)))
-    return () => { alive = false }
-  }, [strategyId])
+  useEffect(() => { setSort(null) }, [data])
   const rows = useMemo(() => {
     if (!data || !sort) return data?.rows ?? []
     const arr = data.rows.slice()
@@ -408,6 +396,49 @@ function SnapshotSheetModal({ strategyId, name, onClose }: {
   const toggleSort = (c: string) =>
     setSort(s => s?.col === c ? { col: c, dir: s.dir === 'asc' ? 'desc' : 'asc' }
       : { col: c, dir: 'asc' })
+  if (!data || data.rows.length === 0) {
+    return <div className="text-xs text-muted">该日期暂无问财快照数据。</div>
+  }
+  return (
+    <div className="overflow-auto">
+      <div className="text-[11px] text-secondary mb-1">点击列头可按该字段排序（数字/文本）</div>
+      <table className="w-max min-w-full text-left text-xs">
+        <thead>
+          <tr className="text-secondary border-b border-border">
+            {data.columns.map(c => (
+              <th key={c} onClick={() => toggleSort(c)}
+                className="py-1 px-2 whitespace-nowrap cursor-pointer select-none hover:text-foreground">
+                {c}{sort?.col === c ? (sort.dir === 'asc' ? ' ↑' : ' ↓') : ''}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={i} className="border-b border-border/50">
+              {data.columns.map(c => <td key={c} className="py-1 px-2 whitespace-nowrap">{String(r[c] ?? '')}</td>)}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function SnapshotSheetModal({ strategyId, name, onClose }: {
+  strategyId: string
+  name: string
+  onClose: () => void
+}) {
+  const [data, setData] = useState<SnapshotSheet | null>(null)
+  const [err, setErr] = useState('')
+  useEffect(() => {
+    let alive = true
+    paperApi.snapshot(strategyId)
+      .then(d => alive && setData(d))
+      .catch(e => alive && setErr(String(e)))
+    return () => { alive = false }
+  }, [strategyId])
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/50 p-6 overflow-auto" onClick={onClose}>
       <div className="rounded-btn bg-elevated border border-border p-4 flex flex-col gap-3 w-full max-w-5xl max-h-[85vh] overflow-auto" onClick={e => e.stopPropagation()}>
@@ -416,32 +447,92 @@ function SnapshotSheetModal({ strategyId, name, onClose }: {
           <button onClick={onClose} className="text-xs text-secondary hover:text-foreground">× 关闭</button>
         </div>
         {err && <div className="text-xs text-red-400">{err}</div>}
-        {!data || data.rows.length === 0 ? (
+        {!data && !err && <div className="text-xs text-muted">加载中…</div>}
+        {data && data.rows.length === 0 && (
           <div className="text-xs text-muted">暂无问财快照，或尚未到定时选股时间。可点击「拉取」手动获取一次。</div>
-        ) : (
-          <div className="overflow-auto">
-            <div className="text-[11px] text-secondary mb-1">点击列头可按该字段排序（数字/文本）</div>
-            <table className="w-max min-w-full text-left text-xs">
-              <thead>
-                <tr className="text-secondary border-b border-border">
-                  {data.columns.map(c => (
-                    <th key={c} onClick={() => toggleSort(c)}
-                      className="py-1 px-2 whitespace-nowrap cursor-pointer select-none hover:text-foreground">
-                      {c}{sort?.col === c ? (sort.dir === 'asc' ? ' ↑' : ' ↓') : ''}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((r, i) => (
-                  <tr key={i} className="border-b border-border/50">
-                    {data.columns.map(c => <td key={c} className="py-1 px-2 whitespace-nowrap">{String(r[c] ?? '')}</td>)}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
         )}
+        {data && data.rows.length > 0 && <SnapshotTable data={data} />}
+      </div>
+    </div>
+  )
+}
+
+function HistoryPanelModal({ strategies, initialStrategyId, onClose }: {
+  strategies: PaperStrategy[]
+  initialStrategyId?: string
+  onClose: () => void
+}) {
+  const [sid, setSid] = useState(initialStrategyId ?? strategies[0]?.id ?? '')
+  const [dates, setDates] = useState<string[]>([])
+  const [date, setDate] = useState('')
+  const [data, setData] = useState<SnapshotSheet | null>(null)
+  const [err, setErr] = useState('')
+  const [loading, setLoading] = useState(false)
+
+  // 切换策略 → 拉取该策略的落盘日期列表，默认选最新一天
+  useEffect(() => {
+    let alive = true
+    setDates([]); setDate(''); setData(null); setErr('')
+    if (!sid) return
+    paperApi.iwencaiDates(sid)
+      .then(ds => {
+        if (!alive) return
+        setDates(ds)
+        if (ds.length) setDate(ds[ds.length - 1])
+        else setErr('该策略暂无落盘的选股快照')
+      })
+      .catch(e => alive && setErr(String(e)))
+    return () => { alive = false }
+  }, [sid])
+
+  // 切换日期 → 拉取当日选股明细
+  useEffect(() => {
+    let alive = true
+    if (!sid || !date) { setData(null); return }
+    setData(null); setLoading(true); setErr('')
+    paperApi.snapshot(sid, date)
+      .then(d => alive && setData(d))
+      .catch(e => alive && setErr(String(e)))
+      .finally(() => alive && setLoading(false))
+    return () => { alive = false }
+  }, [sid, date])
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/50 p-6 overflow-auto" onClick={onClose}>
+      <div className="rounded-btn bg-elevated border border-border p-4 flex flex-col gap-3 w-full max-w-5xl max-h-[85vh] overflow-auto" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between">
+          <span className="text-sm font-medium">选股历史 · 按日期查看落盘的选股数据</span>
+          <button onClick={onClose} className="text-xs text-secondary hover:text-foreground">× 关闭</button>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-1">
+          {strategies.map(s => (
+            <button key={s.id} onClick={() => setSid(s.id)}
+              className={`h-7 px-3 rounded-btn text-xs border ${s.id === sid
+                ? 'bg-primary text-primary-foreground border-primary'
+                : 'bg-elevated text-secondary border-border hover:text-foreground'}`}>
+              {s.name}
+            </button>
+          ))}
+          {strategies.length === 0 && <span className="text-xs text-muted">暂无策略</span>}
+        </div>
+
+        <div className="flex items-center gap-2 text-xs text-secondary">
+          <span>日期</span>
+          <select className={inputCls} value={date} onChange={e => setDate(e.target.value)}
+            disabled={!dates.length}>
+            {!dates.length && <option value="">— 无快照 —</option>}
+            {dates.slice().reverse().map(d => <option key={d} value={d}>{d}</option>)}
+          </select>
+          {data && <span className="text-muted">{data.count} 只</span>}
+          {loading && <span className="text-muted">加载中…</span>}
+        </div>
+
+        {err && <div className="text-xs text-red-400">{err}</div>}
+        {!loading && data && data.rows.length === 0 && (
+          <div className="text-xs text-muted">{date} 当日快照为空（问财未返回结果）。</div>
+        )}
+        {!loading && data && data.rows.length > 0 && <SnapshotTable data={data} />}
       </div>
     </div>
   )
@@ -567,6 +658,7 @@ function PaperPage() {
   const [accEditDraft, setAccEditDraft] = useState<{ name: string; initial_cash: number } | null>(null)
   const [manualAcc, setManualAcc] = useState<Account | null>(null)
   const [manualDraft, setManualDraft] = useState<ManualTrade>({ symbol: '', side: 'buy', qty: 100, price: 0, date: '' })
+  const [showHistory, setShowHistory] = useState(false)
 
   const load = async () => {
     const [a, s, opt] = await Promise.all([paperApi.accounts(), paperApi.strategies(), paperApi.options()])
@@ -674,12 +766,22 @@ function PaperPage() {
         <h1 className="text-lg font-medium text-foreground flex items-center gap-2">
           <Wallet size={18} /> 问财实盘模拟
         </h1>
-        <button onClick={openCreate} className="inline-flex items-center gap-1 h-8 px-3 rounded-btn bg-primary text-primary-foreground text-xs hover:opacity-90">
-          <Save size={13} /> 新建策略
-        </button>
+        <span className="flex items-center gap-2">
+          <button onClick={() => setShowHistory(true)} disabled={!strategies.length}
+            className="inline-flex items-center gap-1 h-8 px-3 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground disabled:opacity-50">
+            <History size={13} /> 选股历史
+          </button>
+          <button onClick={openCreate} className="inline-flex items-center gap-1 h-8 px-3 rounded-btn bg-primary text-primary-foreground text-xs hover:opacity-90">
+            <Save size={13} /> 新建策略
+          </button>
+        </span>
       </div>
 
       {msg && <div className="rounded-btn bg-amber-500/10 text-amber-300 text-xs px-3 py-2">{msg}</div>}
+
+      {showHistory && (
+        <HistoryPanelModal strategies={strategies} onClose={() => setShowHistory(false)} />
+      )}
 
       <div className="flex flex-col gap-3">
         {strategies.map(s => (

@@ -241,6 +241,11 @@ def _generate_buys(account: Account, strategy: PaperStrategy, candidates: list[s
     return buys
 
 
+def strategy_signal_ids(strategy: PaperStrategy) -> set[str]:
+    """策略买入/卖出规则引用的全部信号 id(供 day_rows 按需计算 csg 列)。"""
+    return set(strategy.buy_rule.signal_ids) | set(strategy.sell_rule.exit_signal_ids)
+
+
 def process_day(market: MarketData, account: Account, strategy: PaperStrategy,
                 date: str, candidates: list[str],
                 iwencai_rows: dict[str, dict] | None = None) -> tuple[list[TradeRecord], DaySnapshot]:
@@ -248,7 +253,7 @@ def process_day(market: MarketData, account: Account, strategy: PaperStrategy,
 
     iwencai_rows: 当日问财快照的归一化字段（{symbol: {field: value}}），供买入字段条件判定。
     """
-    rows = market.day_rows(date)
+    rows = market.day_rows(date, strategy_signal_ids(strategy))
 
     trades: list[TradeRecord] = []
     trades += _fill_pending(market, account, strategy, rows, date)     # 1. 次日开盘
