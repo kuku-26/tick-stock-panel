@@ -2,11 +2,14 @@
 """问财实盘模拟 — 账户更新 / 手动交易 API 测试（直接调用端点函数 + 注入临时 store）。"""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from app.paper import context
 from app.paper.api import (AccountUpdateModel, ManualTradeModel,
-                           manual_trade, update_account)
+                           account_detail, manual_trade, update_account)
+from app.paper.market import DayRow
 from app.paper.models import Account, PaperStrategy
 from app.paper.store import PaperStore
 
@@ -62,3 +65,58 @@ def test_manual_trade_appends_record_to_bound_strategy(tmp_path):
     assert trades[0]["reason"] == "manual"
     assert trades[0]["symbol"] == "600000.SH"
     assert trades[0]["side"] == "buy"
+
+
+# ── 账户详情：持仓名称/现价/收益率与流水名称 ──────────────
+
+
+class _FakeRepo:
+    def get_name_map(self, symbols=None):
+        return {"600000.SH": "浦发银行"}
+
+
+class _FakeMarket:
+    def latest_date(self):
+        return "2026-01-02"
+
+    def day_rows(self, date, signal_ids=None):
+        return {"600000.SH": DayRow(symbol="600000.SH", open=10.0,
+                                    close=12.0, volume=1000)}
+
+
+def test_account_detail_names_and_pnl(tmp_path):
+    """持仓/流水应带名称, 持仓带最新价与收益率(相对成本价)。"""
+    store = _seed(tmp_path)
+    manual_trade("acc1", ManualTradeModel(symbol="600000.SH", side="buy",
+                                          qty=100, price=10.0), None)
+    context.set_instances(store, _FakeMarket(), None)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        store=store, repo=_FakeRepo())))
+    detail = account_detail("acc1", request)
+    pos = detail["positions"][0]
+    assert pos["name"] == "浦发银行"
+    assert pos["last_price"] == 12.0
+    assert pos["pnl_pct"] == 20.0  # (12-10)/10*100
+    assert detail["trades"][0]["name"] == "浦发银行"
+
+
+def test_account_detail_without_market_data(tmp_path):
+    """无行情时 last_price/pnl_pct 为 null, 名称回退为代码, 不报错。"""
+    store = _seed(tmp_path)
+    manual_trade("acc1", ManualTradeModel(symbol="600000.SH", side="buy",
+                                          qty=100, price=10.0), None)
+
+    class _NoDataMarket:
+        def latest_date(self):
+            return None
+
+        def day_rows(self, date, signal_ids=None):
+            return {}
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        store=store, repo=_FakeRepo())))
+    context.set_instances(store, _NoDataMarket(), None)
+    detail = account_detail("acc1", request)
+    pos = detail["positions"][0]
+    assert pos["last_price"] is None and pos["pnl_pct"] is None
+    assert pos["name"] == "浦发银行"

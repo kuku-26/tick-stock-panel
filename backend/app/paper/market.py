@@ -33,6 +33,8 @@ class DayRow:
     open: float
     close: float
     volume: float
+    high: float | None = None
+    low: float | None = None
     prev_close: float | None = None
     csg: dict[str, bool] = None  # csg_<id> -> bool；None 表示当日无该信号列
 
@@ -141,6 +143,8 @@ class MarketData:
                 open=_f(r.get("open")),
                 close=_f(r.get("close")),
                 volume=_f(r.get("volume")),
+                high=_f(r.get("high")),
+                low=_f(r.get("low")),
                 prev_close=_f(r.get("prev_close")),
                 csg=csg or None,
             )
@@ -189,12 +193,21 @@ class MarketData:
 
     # ── 可成交判断 ──────────────────────────────────
     def buyable_at_open(self, symbol: str, row: DayRow | None) -> bool:
-        """次日开盘是否可买入：有行情、非停牌、开盘未封涨停。"""
+        """开盘是否可买入：有行情、非停牌、非一字板、开盘未封涨停。"""
         if row is None:
             return False
         if row.open is None or row.open <= 0 or row.volume is None or row.volume <= 0:
             return False  # 停牌 / 无成交
-        limit = self.symbol_limit_up(symbol) or self._heuristic_limit_up(symbol, row.prev_close)
+        if row.high is not None and row.low is not None \
+                and row.high > 0 and row.low > 0 \
+                and abs(row.high - row.low) <= row.high * 1e-6:
+            return False  # 一字板(最高=最低, 全天封死), 开盘无法买到
+        limit = self.symbol_limit_up(symbol)
+        heuristic = self._heuristic_limit_up(symbol, row.prev_close)
+        if limit is not None and heuristic is not None \
+                and abs(limit - heuristic) > heuristic * 0.02:
+            limit = None  # 维表涨停价与按比例推算偏差过大(过期/口径不符), 弃用
+        limit = limit or heuristic
         if limit and row.open >= limit - 0.001:
             return False  # 开盘即封涨停，无法买到
         return True
@@ -204,6 +217,12 @@ class MarketData:
         if row is None:
             return False
         return row.close is not None and row.close > 0
+
+    def latest_date(self) -> str | None:
+        """enriched 最新分区日期(通常为最近一个已落盘交易日); 无数据返回 None。"""
+        ds = sorted(p.name.removeprefix("date=")
+                    for p in self._enriched.glob("date=*") if p.is_dir())
+        return ds[-1] if ds else None
 
 
 def _f(v) -> float | None:

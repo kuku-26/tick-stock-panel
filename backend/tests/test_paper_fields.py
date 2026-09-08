@@ -249,9 +249,12 @@ def test_account_detail_resolves_bound_strategy(tmp_path):
     pc.set_instances(store, None, None)
     detail = account_detail("acc1", SimpleNamespace())
     assert detail["strategy_id"] == "strat1"
-    assert detail["positions"] == [{"symbol": "000560", "qty": 1000, "avg_cost": 3.0}]
+    # 无维表/行情时名称回退为代码, 现价与收益率为 null
+    assert detail["positions"] == [{"symbol": "000560", "qty": 1000, "avg_cost": 3.0,
+                                    "name": "000560", "last_price": None, "pnl_pct": None}]
     assert detail["days"][0]["total_value"] == 100000.0
     assert detail["trades"][0]["amount"] == 3000.0
+    assert detail["trades"][0]["name"] == "000560"
 
 
 def test_account_detail_no_bound_is_empty(tmp_path):
