@@ -332,12 +332,21 @@ function AccountDetailPanel({ detail, onEdit, onManualTrade }: {
         ) : (
           <table className="w-full text-left text-xs">
             <thead>
-              <tr className="text-secondary border-b border-border"><th className="py-1">代码</th><th>数量</th><th>成本价</th></tr>
+              <tr className="text-secondary border-b border-border">
+                <th className="py-1">代码</th><th>名称</th><th>数量</th><th>成本价</th><th>现价</th><th>收益率</th>
+              </tr>
             </thead>
             <tbody>
               {detail.positions.map(p => (
                 <tr key={p.symbol} className="border-b border-border/50">
-                  <td className="py-1">{p.symbol}</td><td>{p.qty}</td><td>{p.avg_cost}</td>
+                  <td className="py-1">{p.symbol}</td>
+                  <td>{p.name && p.name !== p.symbol ? p.name : <span className="text-muted">-</span>}</td>
+                  <td>{p.qty}</td>
+                  <td>{p.avg_cost}</td>
+                  <td>{p.last_price ?? '-'}</td>
+                  <td className={(p.pnl_pct ?? 0) > 0 ? 'text-red-300' : (p.pnl_pct ?? 0) < 0 ? 'text-emerald-300' : ''}>
+                    {p.pnl_pct != null ? `${p.pnl_pct > 0 ? '+' : ''}${p.pnl_pct}%` : '-'}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -354,7 +363,7 @@ function AccountDetailPanel({ detail, onEdit, onManualTrade }: {
             <table className="w-full text-left text-xs">
               <thead>
                 <tr className="text-secondary border-b border-border">
-                  <th className="py-1">日期</th><th>代码</th><th>方向</th><th>数量</th><th>价格</th><th>金额</th><th>原因</th>
+                  <th className="py-1">日期</th><th>代码</th><th>名称</th><th>方向</th><th>数量</th><th>价格</th><th>金额</th><th>原因</th>
                 </tr>
               </thead>
               <tbody>
@@ -362,6 +371,7 @@ function AccountDetailPanel({ detail, onEdit, onManualTrade }: {
                   <tr key={i} className="border-b border-border/50">
                     <td className="py-1">{t.date}</td>
                     <td>{t.symbol}</td>
+                    <td>{t.name && t.name !== t.symbol ? t.name : <span className="text-muted">-</span>}</td>
                     <td className={t.side === 'buy' ? 'text-red-300' : 'text-emerald-300'}>{t.side === 'buy' ? '买入' : '卖出'}</td>
                     <td>{t.qty}</td><td>{t.price}</td>
                     <td>{t.amount?.toLocaleString()}</td>

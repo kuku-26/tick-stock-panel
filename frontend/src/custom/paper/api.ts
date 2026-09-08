@@ -94,6 +94,7 @@ export interface Trade {
   price: number
   amount: number
   reason: string
+  name?: string | null
 }
 
 export interface DaySummary {
@@ -116,6 +117,9 @@ export interface AccountPosition {
   symbol: string
   qty: number
   avg_cost: number
+  name?: string | null
+  last_price?: number | null
+  pnl_pct?: number | null
 }
 
 export interface AccountDetail {
