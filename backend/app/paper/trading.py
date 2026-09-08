@@ -169,12 +169,14 @@ def _buy_today(account: Account, strategy: PaperStrategy, sym: str, qty: int,
 
 def _generate_buys(account: Account, strategy: PaperStrategy, candidates: list[str],
                    rows: dict[str, DayRow], date: str, existing: set[str],
-                   iwencai_rows: dict[str, dict] | None = None) -> list[TradeRecord]:
+                   iwencai_rows: dict[str, dict] | None = None,
+                   market: MarketData | None = None) -> list[TradeRecord]:
     """按买入规则生成买入并返回当日产生的买入成交。
 
     排序：按 sort_field 的归一化数值升/降序（缺失值排末尾）；再取 top_n。
     仓位：单股受 max_position_pct 限制；总投入（持仓+待买入）受 max_total_pct 上限。
-    成交时点：next_open → 生成待买入单（次日开盘成交）；same_open → 当日立即用开盘价买入。
+    成交时点：next_open → 生成待买入单（次日开盘成交，成交时再检查可买性）；
+    same_open → 当日立即用开盘价买入（开盘涨停/一字板/停牌不可买，跳过）。
     """
     rule = strategy.buy_rule
     iwencai_rows = iwencai_rows or {}
@@ -229,6 +231,10 @@ def _generate_buys(account: Account, strategy: PaperStrategy, candidates: list[s
         price = (rows[sym].open if same_open else rows[sym].close) or 0.0
         if price <= 0:
             continue
+        if same_open and market is not None \
+                and not market.buyable_at_open(sym, rows[sym]):
+            logger.info("paper buy skip %s: 当日开盘不可买(一字板/涨停/停牌)", sym)
+            continue
         budget = min(per_budget, account.cash, total_budget)
         qty = int(budget // (price * LOT)) * LOT
         if qty < LOT:
@@ -246,21 +252,47 @@ def strategy_signal_ids(strategy: PaperStrategy) -> set[str]:
     return set(strategy.buy_rule.signal_ids) | set(strategy.sell_rule.exit_signal_ids)
 
 
+def _align_symbol_keys(rows: dict[str, DayRow], candidates: list[str],
+                       iwencai_rows: dict[str, dict] | None
+                       ) -> tuple[list[str], dict[str, dict] | None]:
+    """把问财侧的 6 位股票代码对齐到行情侧的 symbol 格式。
+
+    行情(enriched)的代码带交易所后缀(如 603976.SH)，问财快照归一化后是
+    6 位码(603976)；不统一则结算时 rows.get(候选) 全部落空，静默零成交。
+    这里从行情键构建 {6位: 全码} 别名映射后改写候选与字段索引；行情键
+    本身就是 6 位码时映射恒等，故对单测假行情与存量数据均安全。
+    """
+    alias: dict[str, str] = {}
+    for full in rows:
+        base = full.split(".", 1)[0]
+        if base and base not in alias:
+            alias[base] = full
+    if not alias:
+        return candidates, iwencai_rows
+    cands = [alias.get(c, c) for c in candidates]
+    fields = None
+    if iwencai_rows:
+        fields = {alias.get(k, k): v for k, v in iwencai_rows.items()}
+    return cands, fields
+
+
 def process_day(market: MarketData, account: Account, strategy: PaperStrategy,
                 date: str, candidates: list[str],
                 iwencai_rows: dict[str, dict] | None = None) -> tuple[list[TradeRecord], DaySnapshot]:
     """结算一个交易日，返回 (trades, snapshot)。会就地修改 account。
 
     iwencai_rows: 当日问财快照的归一化字段（{symbol: {field: value}}），供买入字段条件判定。
+    问财候选/字段与行情的代码格式差异在此统一（见 _align_symbol_keys）。
     """
     rows = market.day_rows(date, strategy_signal_ids(strategy))
+    candidates, iwencai_rows = _align_symbol_keys(rows, candidates, iwencai_rows)
 
     trades: list[TradeRecord] = []
     trades += _fill_pending(market, account, strategy, rows, date)     # 1. 次日开盘
     trades += _sell_positions(market, account, strategy, rows, date)   # 2. 当日收盘卖出
     existing = set(account.positions) | {p.symbol for p in account.pending}
     trades += _generate_buys(account, strategy, candidates or [], rows, date,
-                             existing, iwencai_rows)                    # 3. 买入（当日开盘 或 生成PB）
+                             existing, iwencai_rows, market)            # 3. 买入（当日开盘 或 生成PB）
 
     # 4. 结算：市值 + 净值 + 持有天数 +1
     market_value = 0.0

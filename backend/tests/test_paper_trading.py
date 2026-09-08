@@ -7,7 +7,7 @@ import dataclasses
 import pytest
 
 from app.paper import context
-from app.paper.market import DayRow
+from app.paper.market import DayRow, MarketData
 from app.paper.models import (Account, BuyRule, PaperStrategy, SellRule,
                               LOT, Position)
 from app.paper.scheduler import PaperScheduler, _simulate
@@ -421,7 +421,7 @@ def test_simulate_settles_when_data_ready(tmp_path):
 
 
 def test_process_day_passes_strategy_signals_to_market():
-    """process_day 应把策略买卖规则引用的信号集传给 day_rows（按需计算 csg 列）。"""
+    """process_day 应把策略买卖规则引用的信号集传给 day_rows(按需计算 csg 列)。"""
     mk = FakeMarket({"2026-01-02": {"000001": r("000001", 10, 10)}})
     acct = make_account()
     s = make_strategy()
@@ -429,3 +429,73 @@ def test_process_day_passes_strategy_signals_to_market():
     s.sell_rule.exit_signal_ids = ["out_b"]
     process_day(mk, acct, s, "2026-01-02", candidates=[])
     assert mk.day_rows_calls == [("2026-01-02", ("out_b", "sig_a"))]
+
+
+# ── 代码格式对齐(问财 6 位码 vs 行情带后缀) ────────────
+
+
+def test_process_day_aligns_iwencai_code_to_market_symbol():
+    """问财候选/字段为 6 位码、行情键带交易所后缀时, 结算应能正常买入。
+
+    回归测试: 此前 rows.get(6位码) 全部落空导致静默零成交。
+    """
+    mk = FakeMarket({"2026-01-02": {
+        "603976.SH": r("603976.SH", 36.1, 37.0),
+        "000523.SZ": r("000523.SZ", 3.96, 4.0),
+        "600371.SH": r("600371.SH", 2.5, 2.6),
+    }})
+    acct = make_account()
+    s = make_strategy()
+    s.buy_rule.buy_time = "same_open"
+    s.buy_rule.sort_field = "dde_net"
+    s.buy_rule.sort_order = "desc"
+    s.buy_rule.top_n = 3
+    s.buy_rule.max_position_pct = 0.5
+    cands = ["603976", "000523", "600371"]
+    iwencai_rows = {
+        "603976": {"dde_net": 0.012, "name": "正川股份"},
+        "000523": {"dde_net": 0.28, "name": "红棉股份"},
+        "600371": {"dde_net": 0.054, "name": "华远地产"},
+    }
+    trades, _ = process_day(mk, acct, s, "2026-01-02", cands, iwencai_rows)
+    bought = {t.symbol for t in trades if t.side == "buy"}
+    assert bought == {"603976.SH", "000523.SZ", "600371.SH"}, \
+        "候选与字段代码应自动对齐到行情格式并完成买入"
+
+
+# ── 一字板/开盘涨停不买入 ────────────────────────────────
+
+
+def test_market_buyable_at_open_rejects_one_word_board(tmp_path):
+    """一字板(最高=最低, 全天封死)与开盘涨停都不可买。"""
+    mk = MarketData(tmp_path / "no_such_data")
+    one_word = DayRow(symbol="000523.SZ", open=3.96, close=3.96,
+                      volume=1000, high=3.96, low=3.96)
+    assert mk.buyable_at_open("000523.SZ", one_word) is False, "一字板应不可买"
+    normal = DayRow(symbol="600000.SH", open=10.0, close=10.5,
+                    volume=1000, high=10.8, low=9.9)
+    assert mk.buyable_at_open("600000.SH", normal) is True
+
+
+def test_same_open_skips_open_limit_up(tmp_path):
+    """same_open 买入时开盘涨停/一字板跳过, 其余候选照常买入。"""
+    mk = FakeMarket(
+        {"2026-01-02": {
+            "000523": r("000523", 3.96, 3.96, volume=1000),
+            "600000": r("600000", 10.0, 10.2, volume=1000),
+        }},
+        limit_up={"000523": 3.96},
+    )
+    acct = make_account()
+    s = make_strategy()
+    s.buy_rule.buy_time = "same_open"
+    s.buy_rule.sort_field = "dde_net"
+    s.buy_rule.sort_order = "desc"
+    s.buy_rule.top_n = 2
+    s.buy_rule.max_position_pct = 0.5
+    trades, snap = process_day(
+        mk, acct, s, "2026-01-02", ["000523", "600000"],
+        {"000523": {"dde_net": 0.9}, "600000": {"dde_net": 0.1}})
+    bought = {t.symbol for t in trades if t.side == "buy"}
+    assert bought == {"600000"}, "开盘涨停的 000523 应被跳过"
+    assert "000523" not in snap.positions

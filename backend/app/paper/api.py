@@ -464,7 +464,11 @@ def latest_snapshot(strategy_id: str, request: Request):
 
 @router.get("/account/{account_id}/detail")
 def account_detail(account_id: str, request: Request):
-    """账户详情：持仓股 / 交易流水 / 余额曲线（复用一对一绑定策略的快照与成交）。"""
+    """账户详情：持仓股 / 交易流水 / 余额曲线（复用一对一绑定策略的快照与成交）。
+
+    持仓附加名称/最新价/收益率（最新价取 enriched 最新交易日的收盘价，
+    无行情时为 null，收益率不计）；流水附加名称。
+    """
     store = _store(request)
     accounts = store.load_accounts()
     if account_id not in accounts:
@@ -496,8 +500,33 @@ def account_detail(account_id: str, request: Request):
                 "amount": round((t.get("qty") or 0) * (t.get("price") or 0), 2),
             })
 
-    positions = [{"symbol": p.symbol, "qty": p.qty, "avg_cost": p.avg_cost}
-                 for p in account.positions.values()]
+    # 名称/最新价：名称走全局维表，最新价取最新交易日收盘（缺行情则为 null）
+    symbols = list({*account.positions, *(t["symbol"] for t in trades)})
+    name_map: dict[str, str] = {}
+    try:
+        name_map = request.app.state.repo.get_name_map(symbols)
+    except Exception:
+        name_map = {}
+    last_price: dict[str, float | None] = {}
+    try:
+        latest = _market(request).latest_date()
+        rows = _market(request).day_rows(latest) if latest else {}
+        last_price = {s: (rows.get(s).close if rows.get(s) else None) for s in symbols}
+    except Exception:
+        last_price = {s: None for s in symbols}
+
+    positions = []
+    for p in account.positions.values():
+        last = last_price.get(p.symbol)
+        pnl = round((last - p.avg_cost) / p.avg_cost * 100, 2) \
+            if (last is not None and p.avg_cost) else None
+        positions.append({
+            "symbol": p.symbol, "qty": p.qty, "avg_cost": p.avg_cost,
+            "name": name_map.get(p.symbol) or p.symbol,
+            "last_price": last, "pnl_pct": pnl,
+        })
+    for t in trades:
+        t["name"] = name_map.get(t["symbol"]) or t["symbol"]
     return {
         "account": account.to_dict(),
         "strategy_id": bound.id if bound else None,
