@@ -212,7 +212,7 @@ function StrategyForm({
         )}
 
         <div className="flex items-end gap-2 flex-wrap">
-          <Field label="问财字段条件（OR）">
+          <Field label="问财字段条件（多条同时满足）">
             <select className={inputCls} value={fieldSel} onChange={e => setFieldSel(e.target.value)}>
               <option value="">— 选择字段 —</option>
               {effFields.map(f => <option key={f.key} value={f.key}>{f.label} ({f.key})</option>)}
@@ -552,7 +552,7 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onSimulate, onDelete, onEdi
   s: PaperStrategy
   onOpen: () => void
   onPatch: (patch: Partial<PaperStrategy>) => void
-  onFetch: () => void
+  onFetch: () => void | Promise<void>
   onSimulate: () => void
   onDelete: () => void
   onEditAccount: (accountId: string) => void
@@ -560,6 +560,8 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onSimulate, onDelete, onEdi
 }) {
   const [detail, setDetail] = useState<AccountDetail | null>(null)
   const [showSheet, setShowSheet] = useState(false)
+  const [confirmFetch, setConfirmFetch] = useState<{ latest: string | null } | null>(null)
+  const [checking, setChecking] = useState(false)
   useEffect(() => {
     let alive = true
     setDetail(null)
@@ -568,6 +570,34 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onSimulate, onDelete, onEdi
     }
     return () => { alive = false }
   }, [s.id, s.account_id])
+
+  const todayStr = () => {
+    const d = new Date()
+    const p = (n: number) => String(n).padStart(2, '0')
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+  }
+  // 「拉取」优先复用当天落盘数据；当天没有落盘才询问是否实时拉取问财
+  const handleFetch = async () => {
+    if (checking) return
+    setChecking(true)
+    try {
+      const sheet = await paperApi.snapshot(s.id)
+      if (sheet.date === todayStr()) {
+        setShowSheet(true) // 当天已落盘 → 直接展示落盘明细
+        return
+      }
+      setConfirmFetch({ latest: sheet.date })
+    } catch {
+      setConfirmFetch({ latest: null })
+    } finally {
+      setChecking(false)
+    }
+  }
+  const confirmFetchNow = async () => {
+    setConfirmFetch(null)
+    await onFetch()
+    setShowSheet(true) // 拉取落盘完成后展示当日明细
+  }
 
   return (
     <div className="rounded-btn border border-border p-4 flex flex-col gap-2">
@@ -601,7 +631,7 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onSimulate, onDelete, onEdi
         <button onClick={() => setShowSheet(true)} className="inline-flex items-center gap-1 h-7 px-2 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground hover:bg-elevated/80">
           <LineChart size={12} /> 选股名单
         </button>
-        <button onClick={onFetch} className="inline-flex items-center gap-1 h-7 px-2 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground hover:bg-elevated/80">
+        <button onClick={handleFetch} disabled={checking} className="inline-flex items-center gap-1 h-7 px-2 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground hover:bg-elevated/80 disabled:opacity-50">
           <RefreshCw size={12} /> 拉取
         </button>
         <button onClick={onSimulate} className="inline-flex items-center gap-1 h-7 px-2 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground hover:bg-elevated/80">
@@ -620,37 +650,88 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onSimulate, onDelete, onEdi
       {showSheet && (
         <SnapshotSheetModal strategyId={s.id} name={s.name} onClose={() => setShowSheet(false)} />
       )}
+      {confirmFetch && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={() => setConfirmFetch(null)}>
+          <div className="rounded-btn bg-elevated border border-border p-4 flex flex-col gap-3 w-full max-w-sm" onClick={e => e.stopPropagation()}>
+            <span className="text-sm font-medium">同步问财选股</span>
+            <div className="text-xs text-secondary leading-relaxed">
+              {confirmFetch.latest
+                ? <>今天（{todayStr()}）还没有落盘选股数据，最新落盘为 <b>{confirmFetch.latest}</b>。</>
+                : '该策略还没有任何落盘选股数据。'}
+              是否实时拉取问财并落盘？
+            </div>
+            <div className="flex justify-end gap-2 pt-1">
+              <button onClick={() => setConfirmFetch(null)} className="h-7 px-3 rounded-btn text-xs bg-elevated text-secondary">取消</button>
+              <button onClick={confirmFetchNow} className="h-7 px-3 rounded-btn text-xs bg-primary text-primary-foreground">拉取并落盘</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
 
 function BalanceCurve({ days }: { days: AccountDay[] }) {
+  // 净值 nav(初始=1.0) → 累计收益率(%)
   const toNum = (v: number | null | undefined) => (typeof v === 'number' ? v : null)
-  const cash = days.map(d => toNum(d.cash))
-  const tot = days.map(d => toNum(d.total_value))
-  const allN = [...cash, ...tot].filter((v): v is number => v !== null)
-  if (days.length === 0 || allN.length === 0) {
-    return <div className="text-xs text-muted">暂无结算数据，无法绘制余额曲线。</div>
+  const pnl = days.map(d => {
+    const nav = toNum(d.nav)
+    return nav === null ? null : (nav - 1) * 100
+  })
+  const known = pnl.filter((v): v is number => v !== null)
+  if (days.length === 0 || known.length === 0) {
+    return <div className="text-xs text-muted">暂无结算数据，无法绘制收益率曲线。</div>
   }
   const pad = 6, w = 340, h = 90
-  const min = Math.min(...allN), max = Math.max(...allN)
+  const min = Math.min(0, ...known), max = Math.max(0, ...known)
   const span = (max - min) || 1
   const n = days.length
   const x = (i: number) => pad + (i * (w - pad * 2) / (n === 1 ? 1 : n - 1))
   const y = (v: number) => h - pad - ((v - min) / span) * (h - pad * 2)
-  const pts = (vals: (number | null)[]) => vals
+  const pts = pnl
     .map((v, i) => (v === null ? null : `${x(i)},${y(v)}`)).filter(Boolean)!.join(' ')
-  const lastCash = cash[cash.length - 1]
-  const lastTot = tot[tot.length - 1]
+  const last = known[known.length - 1]
+  const color = last >= 0 ? '#f87171' : '#34d399'
+  // y 轴刻度：上(max) / 中((max+min)/2) / 下(min)，0 基线单独虚线
+  const fmt = (v: number) => `${v > 0 ? '+' : ''}${v.toFixed(2)}%`
+  // 0% 基线在图内的纵向百分比（用于 HTML 标签定位；max===min 时居中）
+  const zeroTopPct = max === min ? 50 : ((max - 0) / span) * 100
+  const shortDate = (d: string | null | undefined) =>
+    d ? d.slice(5).replace('-', '/') : ''
+  const firstDate = shortDate(days[0]?.date)
+  const lastDate = shortDate(days[days.length - 1]?.date)
   return (
     <div className="flex flex-col gap-1">
-      <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-24" preserveAspectRatio="none">
-        <polyline points={pts(cash)} fill="none" stroke="#f87171" strokeWidth="1.5" />
-        <polyline points={pts(tot)} fill="none" stroke="#60a5fa" strokeWidth="1.5" />
-      </svg>
+      <div className="text-xs font-medium text-secondary">收益率曲线</div>
+      <div className="flex gap-1">
+        {/* y 轴刻度（HTML 标签避免 svg 拉伸变形） */}
+        <div className="relative w-12 shrink-0 h-24 text-[10px] text-muted">
+          <span className="absolute left-0 top-0">{fmt(max)}</span>
+          <span className="absolute left-0 top-1/2 -translate-y-1/2">{fmt((max + min) / 2)}</span>
+          <span className="absolute left-0 bottom-0">{fmt(min)}</span>
+        </div>
+        <div className="relative flex-1">
+          <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-24" preserveAspectRatio="none">
+            <line x1={pad} y1={y(0)} x2={w - pad} y2={y(0)} stroke="#565f89" strokeDasharray="3 3" strokeWidth="0.75" />
+            <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" />
+          </svg>
+          <span className="absolute right-0 text-[10px] text-muted bg-elevated/70 px-0.5"
+            style={{ top: `calc(${zeroTopPct}% - 6px)` }}>0%</span>
+        </div>
+      </div>
+      {/* x 轴：首/尾结算日期 */}
+      <div className="flex justify-between text-[10px] text-muted" style={{ paddingLeft: 52 }}>
+        <span>{firstDate}</span>
+        <span>{lastDate}</span>
+      </div>
       <div className="flex gap-4 text-[11px] text-secondary">
-        <span className="flex items-center gap-1"><i className="h-0.5 w-3 bg-red-400 inline-block" /> 可用资金 {lastCash === null ? '-' : lastCash.toLocaleString()}</span>
-        <span className="flex items-center gap-1"><i className="h-0.5 w-3 bg-blue-400 inline-block" /> 总资产 {lastTot === null ? '-' : lastTot.toLocaleString()}</span>
+        <span className="flex items-center gap-1">
+          <i className="h-0.5 w-3 inline-block" style={{ background: color }} />
+          累计收益率 <b className={last >= 0 ? 'text-red-300' : 'text-emerald-300'}>
+            {last >= 0 ? '+' : ''}{last.toFixed(2)}%
+          </b>
+        </span>
+        <span>结算 {known.length} 天</span>
       </div>
     </div>
   )
