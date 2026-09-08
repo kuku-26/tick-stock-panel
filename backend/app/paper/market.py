@@ -252,6 +252,12 @@ class MarketData:
                     for p in self._enriched.glob("date=*") if p.is_dir())
         return ds[-1] if ds else None
 
+    def latest_date(self) -> str | None:
+        """enriched 最新分区日期(通常为最近一个已落盘交易日); 无数据返回 None。"""
+        ds = sorted(p.name.removeprefix("date=")
+                    for p in self._enriched.glob("date=*") if p.is_dir())
+        return ds[-1] if ds else None
+
 
 def _f(v) -> float | None:
     if v is None:
