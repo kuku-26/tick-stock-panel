@@ -311,6 +311,19 @@ function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade }: {
   const [allTrades, setAllTrades] = useState(false)
   const tradeRows = detail.trades.slice().reverse()
   const shownTrades = allTrades ? tradeRows : tradeRows.slice(0, 5)
+  // 实时净值: 与持仓表同一份实时价按 (cash+Σqty×现价)/initial_cash 计算,
+  // 供收益率曲线末尾追加"实时"点, 使曲线终点与持仓收益对齐(结算数据只到最近收盘)
+  const liveNav = useMemo(() => {
+    const { cash, initial_cash } = detail.account
+    if (typeof cash !== 'number' || typeof initial_cash !== 'number' || initial_cash <= 0) return null
+    if (detail.positions.length === 0) return null
+    let mv = 0
+    for (const p of detail.positions) {
+      if (typeof p.last_price !== 'number' || !(p.last_price > 0)) return null
+      mv += p.qty * p.last_price
+    }
+    return (cash + mv) / initial_cash
+  }, [detail])
   return (
     <div className="rounded-btn border border-border p-4 flex flex-col gap-3">
       <div className="flex items-center justify-between flex-wrap gap-2">
@@ -332,7 +345,7 @@ function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade }: {
         <span>结算 {detail.days.length} 天</span>
       </div>
 
-      <BalanceCurve days={detail.days} />
+      <BalanceCurve days={detail.days} liveNav={liveNav} />
 
       <div>
         <div className="text-xs font-medium text-secondary mb-1">持仓股</div>
@@ -688,13 +701,16 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onDelete, onEditAccount, on
   )
 }
 
-function BalanceCurve({ days }: { days: AccountDay[] }) {
-  // 净值 nav(初始=1.0) → 累计收益率(%)
+function BalanceCurve({ days, liveNav }: { days: AccountDay[]; liveNav: number | null }) {
+  // 净值 nav(初始=1.0) → 累计收益率(%)。结算点来自每日定时结算落盘;
+  // 末尾可追加"实时"点(与持仓表同一份实时价), 使曲线终点与持仓收益对齐
   const toNum = (v: number | null | undefined) => (typeof v === 'number' ? v : null)
-  const pnl = days.map(d => {
+  const settled = days.map(d => {
     const nav = toNum(d.nav)
     return nav === null ? null : (nav - 1) * 100
   })
+  const livePct = typeof liveNav === 'number' && Number.isFinite(liveNav) ? (liveNav - 1) * 100 : null
+  const pnl = livePct !== null ? [...settled, livePct] : settled
   const known = pnl.filter((v): v is number => v !== null)
   if (days.length === 0 || known.length === 0) {
     return <div className="text-xs text-muted">暂无结算数据，无法绘制收益率曲线。</div>
@@ -702,11 +718,18 @@ function BalanceCurve({ days }: { days: AccountDay[] }) {
   const pad = 6, w = 340, h = 90
   const min = Math.min(0, ...known), max = Math.max(0, ...known)
   const span = (max - min) || 1
-  const n = days.length
+  const n = pnl.length
   const x = (i: number) => pad + (i * (w - pad * 2) / (n === 1 ? 1 : n - 1))
   const y = (v: number) => h - pad - ((v - min) / span) * (h - pad * 2)
-  const pts = pnl
+  const pts = settled
     .map((v, i) => (v === null ? null : `${x(i)},${y(v)}`)).filter(Boolean)!.join(' ')
+  // 结算末点 → 实时点用虚线衔接并画圆点标记
+  let lastSettledIdx = -1
+  for (let i = settled.length - 1; i >= 0; i--) if (settled[i] !== null) { lastSettledIdx = i; break }
+  const liveX = livePct !== null ? x(pnl.length - 1) : null
+  const liveY = livePct !== null ? y(livePct) : null
+  const liveSeg = liveX !== null && liveY !== null && lastSettledIdx >= 0
+    ? `${x(lastSettledIdx)},${y(settled[lastSettledIdx] as number)} ${liveX},${liveY}` : null
   const last = known[known.length - 1]
   const color = last >= 0 ? '#f87171' : '#34d399'
   // y 轴刻度：上(max) / 中((max+min)/2) / 下(min)，0 基线单独虚线
@@ -717,6 +740,7 @@ function BalanceCurve({ days }: { days: AccountDay[] }) {
     d ? d.slice(5).replace('-', '/') : ''
   const firstDate = shortDate(days[0]?.date)
   const lastDate = shortDate(days[days.length - 1]?.date)
+  const settledCount = settled.filter((v): v is number => v !== null).length
   return (
     <div className="flex flex-col gap-1">
       <div className="text-xs font-medium text-secondary">收益率曲线</div>
@@ -731,15 +755,17 @@ function BalanceCurve({ days }: { days: AccountDay[] }) {
           <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-24" preserveAspectRatio="none">
             <line x1={pad} y1={y(0)} x2={w - pad} y2={y(0)} stroke="#565f89" strokeDasharray="3 3" strokeWidth="0.75" />
             <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" />
+            {liveSeg && <polyline points={liveSeg} fill="none" stroke={color} strokeWidth="1.5" strokeDasharray="3 3" />}
+            {liveX !== null && liveY !== null && <circle cx={liveX} cy={liveY} r="2.5" fill={color} />}
           </svg>
           <span className="absolute right-0 text-[10px] text-muted bg-elevated/70 px-0.5"
             style={{ top: `calc(${zeroTopPct}% - 6px)` }}>0%</span>
         </div>
       </div>
-      {/* x 轴：首/尾结算日期 */}
+      {/* x 轴：首/尾日期（有实时点时尾部显示"实时"） */}
       <div className="flex justify-between text-[10px] text-muted" style={{ paddingLeft: 52 }}>
         <span>{firstDate}</span>
-        <span>{lastDate}</span>
+        <span>{liveX !== null ? '实时' : lastDate}</span>
       </div>
       <div className="flex gap-4 text-[11px] text-secondary">
         <span className="flex items-center gap-1">
@@ -747,8 +773,9 @@ function BalanceCurve({ days }: { days: AccountDay[] }) {
           累计收益率 <b className={last >= 0 ? 'text-red-300' : 'text-emerald-300'}>
             {last >= 0 ? '+' : ''}{last.toFixed(2)}%
           </b>
+          {liveX !== null && <span className="text-muted">（实时）</span>}
         </span>
-        <span>结算 {known.length} 天</span>
+        <span>结算 {settledCount} 天</span>
       </div>
     </div>
   )
