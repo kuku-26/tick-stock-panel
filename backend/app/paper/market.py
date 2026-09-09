@@ -81,13 +81,21 @@ class MarketData:
     def _heuristic_limit_up(symbol: str, prev_close: float | None) -> float | None:
         if prev_close is None or prev_close <= 0:
             return None
+        return MarketData._limit_price(symbol, prev_close, +1)
+
+    @staticmethod
+    def _limit_price(symbol: str, prev_close: float, direction: int) -> float | None:
+        """按板块涨跌幅限制推算涨停(+1)/跌停(-1)价。ST 的 5% 档无法从代码判断, 按
+        主板口径处理 (与涨停判定同口径, 不引入额外偏差)。"""
+        if prev_close is None or prev_close <= 0:
+            return None
         if symbol.startswith(("300", "301", "688")):
             pct = 0.20
         elif symbol.startswith(("8", "4")):
             pct = 0.30
         else:
             pct = 0.10
-        return round(prev_close * (1 + pct), 3)
+        return round(prev_close * (1 + direction * pct), 3)
 
     # ── enriched 日线 ─────────────────────────────────
     def day_rows(self, date: str,
@@ -212,11 +220,19 @@ class MarketData:
             return False  # 开盘即封涨停，无法买到
         return True
 
-    def sellable_at_close(self, row: DayRow | None) -> bool:
-        """当日收盘是否可卖出：有行情且有成交。"""
+    def sellable_at_open(self, symbol: str, row: DayRow | None) -> bool:
+        """当日是否可卖出：有行情有成交，且开盘未封跌停。
+
+        开盘即封跌停（含一字跌停）时卖单无法成交，当日不卖（继续持有，
+        等待后续交易日再按规则判定）。
+        """
         if row is None:
             return False
-        return row.close is not None and row.close > 0
+        if row.close is None or row.close <= 0:
+            return False  # 停牌 / 无成交
+        limit_dn = self._limit_price(symbol, row.prev_close, -1)
+        return not (limit_dn is not None and row.open is not None and row.open > 0
+                    and row.open <= limit_dn + 0.001)  # 开盘即封跌停则不可卖
 
     def latest_date(self) -> str | None:
         """enriched 最新分区日期(通常为最近一个已落盘交易日); 无数据返回 None。"""

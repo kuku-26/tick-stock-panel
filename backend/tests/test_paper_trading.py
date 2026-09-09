@@ -17,11 +17,12 @@ from app.paper.trading import decide_exit, entry_signal_passes, process_day
 
 
 class FakeMarket:
-    """内存假行情：{date: {symbol: DayRow}} + 涨停价表。"""
+    """内存假行情：{date: {symbol: DayRow}} + 涨停/跌停价表。"""
 
-    def __init__(self, rows=None, limit_up=None):
+    def __init__(self, rows=None, limit_up=None, limit_down=None):
         self.rows = rows or {}
         self.limit_up = limit_up or {}
+        self.limit_down = limit_down or {}
         self.day_rows_calls: list[tuple[str, tuple[str, ...]]] = []
 
     def day_rows(self, date: str, signal_ids=None):
@@ -39,12 +40,17 @@ class FakeMarket:
             return False
         return True
 
-    def sellable_at_close(self, row: DayRow | None):
-        return bool(row and row.close and row.close > 0)
+    def sellable_at_open(self, symbol: str, row: DayRow | None):
+        if row is None or row.close is None or row.close <= 0:
+            return False
+        lim = self.limit_down.get(symbol)
+        return not (lim and row.open is not None and row.open > 0
+                    and row.open <= lim + 0.001)
 
 
-def r(symbol, open_, close, volume=100000, csg=None):
-    return DayRow(symbol=symbol, open=open_, close=close, volume=volume, csg=csg or {})
+def r(symbol, open_, close, volume=100000, csg=None, high=None, low=None, prev_close=None):
+    return DayRow(symbol=symbol, open=open_, close=close, volume=volume, csg=csg or {},
+                  high=high, low=low, prev_close=prev_close)
 
 
 def make_account(cash=100000):
@@ -499,3 +505,154 @@ def test_same_open_skips_open_limit_up(tmp_path):
     bought = {t.symbol for t in trades if t.side == "buy"}
     assert bought == {"600000"}, "开盘涨停的 000523 应被跳过"
     assert "000523" not in snap.positions
+
+
+# ── 卖出: 开盘跌停不卖 / 止损止盈线价 / sell_time=open ──
+
+
+def test_sell_blocked_when_open_at_limit_down():
+    """开盘即封跌停的持仓当日不卖（跌停无法成交），继续持有。"""
+    # 成本 10，收盘 8.5 触发止损(-0.1 线 9.0)；但开盘 8.5 封跌停(跌停价 9.0? 否，
+    # 用 prev_close=10 → 跌停 9.0，open=9.0 封死) —— 用 prev_close 10/open 9/close 8.5
+    mk = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 10, 10)},
+        "2026-01-03": {"000001": r("000001", 10.2, 11)},
+        "2026-01-04": {"000001": r("000001", 9.0, 8.5, prev_close=9.44)},
+    }, limit_down={"000001": 9.0})
+    acct = make_account()
+    s = make_strategy()
+    s.sell_rule = SellRule(stop_loss_pct=-0.1)
+    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
+    process_day(mk, acct, s, "2026-01-03", candidates=[])  # 买入建仓
+    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
+    assert [t for t in trades if t.side == "sell"] == [], "开盘封跌停当日不可卖"
+    assert "000001" in acct.positions, "持仓应保留到下一交易日"
+
+
+def test_market_sellable_at_open_rejects_limit_down(tmp_path):
+    """真 MarketData: 开盘触及跌停价不可卖, 正常开盘可卖。"""
+    mk = MarketData(tmp_path / "no_such_data")
+    limit_down = DayRow(symbol="600000.SH", open=9.0, close=8.8, volume=1000,
+                        high=9.2, low=8.8, prev_close=10.0)
+    assert mk.sellable_at_open("600000.SH", limit_down) is False, "开盘=跌停价应不可卖"
+    normal = DayRow(symbol="600000.SH", open=9.5, close=9.6, volume=1000,
+                    high=9.8, low=9.3, prev_close=10.0)
+    assert mk.sellable_at_open("600000.SH", normal) is True
+
+
+def test_stop_loss_fills_at_line_price():
+    """止损: 盘中跌破线(触发) → 成交价=止损线价, 而非收盘价。"""
+    mk = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 10, 10)},
+        "2026-01-03": {"000001": r("000001", 10.2, 11)},
+        # open 10.5 > 线 9.0, low 8.7 触线, 收盘 9.4 > 线
+        "2026-01-04": {"000001": r("000001", 10.5, 9.4, high=10.8, low=8.7)},
+    })
+    acct = make_account()
+    s = make_strategy()
+    s.buy_rule.buy_time = "same_open"  # 第一天(01-02)即以开盘价 10 买入, 成本线按 10 推算
+    s.sell_rule = SellRule(stop_loss_pct=-0.1)  # 线价 = 10 × 0.9 = 9.0
+    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
+    process_day(mk, acct, s, "2026-01-03", candidates=[])
+    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
+    sells = [t for t in trades if t.side == "sell"]
+    assert len(sells) == 1 and sells[0].reason == "stop_loss"
+    assert sells[0].price == pytest.approx(9.0), "应按止损线价成交"
+    assert sells[0].price != pytest.approx(9.4), "不应按收盘价成交"
+
+
+def test_take_profit_fills_at_line_price():
+    """止盈: 盘中触线(触发) → 成交价=止盈线价; 收盘回落也不影响。"""
+    mk = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 10, 10)},
+        "2026-01-03": {"000001": r("000001", 10.2, 11)},
+        # open 10.5, high 12.5 触及止盈线 12.0, 收盘回落 11.2
+        "2026-01-04": {"000001": r("000001", 10.5, 11.2, high=12.5, low=10.4)},
+    })
+    acct = make_account()
+    s = make_strategy()
+    s.buy_rule.buy_time = "same_open"  # 第一天(01-02)即以开盘价 10 买入, 成本线按 10 推算
+    s.sell_rule = SellRule(take_profit_pct=0.2)  # 线价 = 10 × 1.2 = 12.0
+    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
+    process_day(mk, acct, s, "2026-01-03", candidates=[])
+    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
+    sells = [t for t in trades if t.side == "sell"]
+    assert len(sells) == 1 and sells[0].reason == "take_profit"
+    assert sells[0].price == pytest.approx(12.0), "应按止盈线价成交"
+
+
+def test_gap_through_line_fills_at_open():
+    """跳空穿越线位按开盘价成交: 低开破止损线按 open(更低), 高开破止盈线按 open(更高)。"""
+    mk = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 10, 10)},
+        "2026-01-03": {"000001": r("000001", 10.2, 11)},
+        # 跳空低开 8.5 < 止损线 9.0
+        "2026-01-04": {"000001": r("000001", 8.5, 8.6, high=9.1, low=8.4)},
+    })
+    acct = make_account()
+    s = make_strategy()
+    s.sell_rule = SellRule(stop_loss_pct=-0.1)
+    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
+    process_day(mk, acct, s, "2026-01-03", candidates=[])
+    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
+    sells = [t for t in trades if t.side == "sell"]
+    assert sells[0].reason == "stop_loss"
+    assert sells[0].price == pytest.approx(8.5), "跳空低开应按开盘价成交(比线价更差)"
+
+    # 跳空高开破止盈线: open 12.6 > 线 12.0 → 按 12.6 成交
+    mk2 = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 10, 10)},
+        "2026-01-03": {"000001": r("000001", 10.2, 11)},
+        "2026-01-04": {"000001": r("000001", 12.6, 12.1, high=12.8, low=11.9)},
+    })
+    acct2 = make_account()
+    s2 = make_strategy()
+    s2.sell_rule = SellRule(take_profit_pct=0.2)
+    process_day(mk2, acct2, s2, "2026-01-02", candidates=["000001"])
+    process_day(mk2, acct2, s2, "2026-01-03", candidates=[])
+    trades2, _ = process_day(mk2, acct2, s2, "2026-01-04", candidates=[])
+    sells2 = [t for t in trades2 if t.side == "sell"]
+    assert sells2[0].reason == "take_profit"
+    assert sells2[0].price == pytest.approx(12.6), "跳空高开应按开盘价成交(比线价更好)"
+
+
+def test_max_hold_days_1_sells_next_open():
+    """持股天数=1 + sell_time=open: 第一天买入, 第二天以开盘价卖出。"""
+    mk = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 10, 10)},
+        "2026-01-03": {"000001": r("000001", 10.7, 11)},
+    })
+    acct = make_account(cash=10000)
+    s = make_strategy()
+    s.buy_rule.buy_time = "same_open"  # 第一天(01-02)即买入建仓
+    s.buy_rule.max_position_pct = 0.5
+    s.sell_rule = SellRule(max_hold_days=1, sell_time="open")
+    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])   # 买入日
+    trades, _ = process_day(mk, acct, s, "2026-01-03", candidates=[])  # 次日
+    sells = [t for t in trades if t.side == "sell"]
+    assert len(sells) == 1 and sells[0].reason == "max_hold"
+    assert sells[0].price == pytest.approx(10.7), "持股天数=1 应在次日以开盘价卖出"
+    assert not acct.positions
+
+
+def test_exit_signal_sell_time_open():
+    """sell_time=open 时信号离场也按结算日开盘价成交。"""
+    mk = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 10, 10)},
+        "2026-01-03": {"000001": r("000001", 10.2, 11)},
+        "2026-01-04": {"000001": r("000001", 11.3, 11.0, csg={"csg_out": True})},
+    })
+    acct = make_account()
+    s = make_strategy()
+    s.sell_rule = SellRule(exit_signal_ids=["out"], sell_time="open")
+    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
+    process_day(mk, acct, s, "2026-01-03", candidates=[])
+    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
+    sells = [t for t in trades if t.side == "sell"]
+    assert sells[0].reason == "exit_signal"
+    assert sells[0].price == pytest.approx(11.3), "sell_time=open 应按开盘价成交"
+
+
+def test_sell_rule_rejects_bad_sell_time():
+    with pytest.raises(ValueError):
+        SellRule.from_dict({"sell_time": "noon"})

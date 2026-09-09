@@ -65,19 +65,25 @@ def buy_signal_passes(strategy: PaperStrategy, row: DayRow | None,
 
 def decide_exit(strategy: PaperStrategy, pos: Position,
                 row: DayRow | None, date: str) -> str | None:
-    """按卖出规则判定是否离场，返回原因；不离开场则 None。"""
+    """按卖出规则判定是否离场，返回原因；不离开场则 None。
+
+    止损/止盈按当日盘中触及判定（low/high 碰到成本×线位即触发），
+    信号与持股天数按结算日状态判定。
+    """
     rule = strategy.sell_rule
     if row is None:
         return None  # 无当日行情，暂缓卖出（数据缺失则继续持有）
     close = row.close
+    low = row.low if (row.low is not None and row.low > 0) else close
+    high = row.high if (row.high is not None and row.high > 0) else close
 
     if rule.exit_signal_ids and any(row.signal(sid) for sid in rule.exit_signal_ids):
         return "exit_signal"
 
-    if rule.take_profit_pct is not None and close >= pos.avg_cost * (1 + rule.take_profit_pct):
+    if rule.take_profit_pct is not None and high >= pos.avg_cost * (1 + rule.take_profit_pct):
         return "take_profit"
 
-    if rule.stop_loss_pct is not None and close <= pos.avg_cost * (1 + rule.stop_loss_pct):
+    if rule.stop_loss_pct is not None and low <= pos.avg_cost * (1 + rule.stop_loss_pct):
         return "stop_loss"
 
     if rule.max_hold_days is not None and pos.hold_days >= rule.max_hold_days:
@@ -118,21 +124,47 @@ def _fill_pending(market: MarketData, account: Account, strategy: PaperStrategy,
     return trades
 
 
+def _exit_fill_price(rule, pos: Position, row: DayRow, reason: str) -> float:
+    """按退出原因确定成交价。
+
+    - stop_loss / take_profit: 按触发线价成交（成本×线位）。开盘跳空穿越
+      线位时按开盘价成交（跳空低开止损成交更低、跳空高开止盈成交更高，
+      与真实限价单/市价单行为一致，避免按线价凭空乐观/悲观）。
+    - 其他（信号/持股天数）: sell_time 决定 —— open=结算日开盘价
+      （持股天数=1 时即次日开盘卖出），close=结算日收盘价。
+    """
+    open_px = row.open if (row.open is not None and row.open > 0) else row.close
+    if reason == "stop_loss" and rule.stop_loss_pct is not None:
+        line = pos.avg_cost * (1 + rule.stop_loss_pct)
+        return min(open_px, line)
+    if reason == "take_profit" and rule.take_profit_pct is not None:
+        line = pos.avg_cost * (1 + rule.take_profit_pct)
+        return max(open_px, line)
+    return open_px if rule.sell_time == "open" else row.close
+
+
 def _sell_positions(market: MarketData, account: Account, strategy: PaperStrategy,
                     rows: dict[str, DayRow], date: str) -> list[TradeRecord]:
-    """对 D 之前建仓的持仓按收盘价卖出（T+1）。"""
+    """对 D 之前建仓的持仓按卖出规则离场（T+1）。
+
+    可卖判定：有行情有成交，且开盘未封跌停（开盘跌停无法卖出，继续持有）。
+    成交价见 _exit_fill_price。
+    """
     trades: list[TradeRecord] = []
+    rule = strategy.sell_rule
     for symbol in list(account.positions.keys()):
         pos = account.positions[symbol]
         if pos.entry_date >= date:
             continue  # 当日新建仓，T+1 不可卖
         row = rows.get(symbol)
-        if not market.sellable_at_close(row):
+        if not market.sellable_at_open(symbol, row):
+            if row is not None:
+                logger.info("paper sell skip %s: 开盘跌停/停牌，当日不可卖", symbol)
             continue
         reason = decide_exit(strategy, pos, row, date)
         if reason is None:
             continue
-        price = row.close
+        price = _exit_fill_price(rule, pos, row, reason)
         qty = pos.qty
         proceeds = qty * price
         account.cash += proceeds

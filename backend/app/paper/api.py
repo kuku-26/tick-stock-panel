@@ -365,21 +365,8 @@ def fetch_now(strategy_id: str, request: Request):
     return {"ok": True, **result}
 
 
-@router.post("/strategies/{strategy_id}/simulate")
-def simulate_now(strategy_id: str, request: Request, date: str | None = None,
-                 fallback: str = ""):
-    store = _store(request)
-    strategy = store.load_strategies().get(strategy_id)
-    if strategy is None:
-        raise HTTPException(status_code=404, detail="策略不存在")
-    date_str = date or _date.today().isoformat()
-    fallback_candidates = [s.strip() for s in fallback.split(",") if s.strip()] if fallback else None
-    try:
-        result = service.run_simulate(store, _market(request), strategy,
-                                      date_str, fallback_candidates)
-    except RuntimeError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"ok": True, **result}
+# 说明: 不提供手动结算端点 —— 结算只由 simulate_time 定时任务执行。
+# 提前手动结算会用未确定的当日价格成交, 打乱策略时序 (T+1/收盘价语义)。
 
 
 # ── 查询 ────────────────────────────────────────────────
@@ -500,20 +487,36 @@ def account_detail(account_id: str, request: Request):
                 "amount": round((t.get("qty") or 0) * (t.get("price") or 0), 2),
             })
 
-    # 名称/最新价：名称走全局维表，最新价取最新交易日收盘（缺行情则为 null）
+    # 名称/最新价：名称走全局维表；最新价优先取实时行情缓存（QuoteService 的
+    # 最新 enriched 合并盘中实时价, 实盘开关关闭/不可用时回退 enriched 最新收盘）
     symbols = list({*account.positions, *(t["symbol"] for t in trades)})
     name_map: dict[str, str] = {}
     try:
         name_map = request.app.state.repo.get_name_map(symbols)
     except Exception:
         name_map = {}
-    last_price: dict[str, float | None] = {}
-    try:
-        latest = _market(request).latest_date()
-        rows = _market(request).day_rows(latest) if latest else {}
-        last_price = {s: (rows.get(s).close if rows.get(s) else None) for s in symbols}
-    except Exception:
-        last_price = {s: None for s in symbols}
+    last_price: dict[str, float | None] = {s: None for s in symbols}
+    if symbols:
+        qs = getattr(request.app.state, "quote_service", None)
+        if qs is not None:
+            try:
+                import polars as pl
+                df, _ = qs.get_enriched_today()
+                if not df.is_empty() and {"symbol", "close"} <= set(df.columns):
+                    sub = df.filter(pl.col("symbol").is_in(symbols))
+                    last_price = {r["symbol"]: float(r["close"])
+                                  for r in sub.select(["symbol", "close"]).to_dicts()
+                                  if r.get("close") is not None}
+            except Exception:
+                pass
+        try:
+            latest = _market(request).latest_date()
+            rows = _market(request).day_rows(latest) if latest else {}
+            for s in symbols:
+                if last_price.get(s) is None and rows.get(s) is not None:
+                    last_price[s] = rows[s].close
+        except Exception:
+            pass
 
     positions = []
     for p in account.positions.values():
