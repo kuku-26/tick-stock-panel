@@ -142,8 +142,10 @@ class SellRule:
 
     exit_signal_ids: 持仓日任一成立即离场（OR）。
     stop_loss_pct / take_profit_pct: 相对持仓成本价的止损/止盈（如 -0.08 = 亏8%止损）。
-    max_hold_days: 最长持有交易日数，超期卖出。None=不限制。
-    sell_time: 固定 close（当日收盘价）。
+        触发判定按当日盘中触及（low/high 碰到线价），成交也按线价（见 trading._sell_positions）。
+    max_hold_days: 最长持有交易日数，超期卖出。None=不限制。1 = 买入次日卖出。
+    sell_time: 信号/持股天数退出的成交时点。close=结算日收盘价（默认）；
+        open=结算日开盘价（持股天数=1 时即"次日开盘卖出"）。止损/止盈始终按线价成交。
     """
 
     exit_signal_ids: list[str] = field(default_factory=list)
@@ -172,11 +174,14 @@ class SellRule:
         hold = int(hold) if hold not in (None, "") else None
         if hold is not None and hold <= 0:
             raise ValueError("max_hold_days 必须为正整数")
+        stime = str(d.get("sell_time", "close")).lower()
+        if stime not in ("close", "open"):
+            raise ValueError("sell_time 只能是 close 或 open")
         return cls(exit_signal_ids=list(sigs),
                    stop_loss_pct=_ratio("stop_loss_pct"),
                    take_profit_pct=_ratio("take_profit_pct"),
                    max_hold_days=hold,
-                   sell_time=str(d.get("sell_time", "close")))
+                   sell_time=stime)
 
     def to_dict(self) -> dict[str, Any]:
         return {"exit_signal_ids": self.exit_signal_ids,

@@ -202,15 +202,6 @@ export const paperApi = {
 
   fetchNow: (id: string) =>
     req<{ ok: boolean }>(`/strategies/${id}/fetch`, { method: 'POST' }),
-  simulateNow: (id: string, date?: string, fallback?: string) => {
-    const q = []
-    if (date) q.push(`date=${date}`)
-    if (fallback) q.push(`fallback=${encodeURIComponent(fallback)}`)
-    return req<{ ok: boolean }>(
-      `/strategies/${id}/simulate${q.length ? `?${q.join('&')}` : ''}`,
-      { method: 'POST' },
-    )
-  },
 
   equity: (id: string) =>
     req<{ equity: Array<{ date: string; nav: number | null; total_value: number | null }> }>(

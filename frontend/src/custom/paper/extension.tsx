@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { LineChart, Wallet, Save, Trash2, RefreshCw, Play, Settings2, Loader2, Plus, Pencil, History } from 'lucide-react'
+import { LineChart, Wallet, Save, Trash2, RefreshCw, Settings2, Loader2, Plus, Pencil, History } from 'lucide-react'
 import type { FrontendExtension } from '@/extensions/types'
 import { paperApi, type Account, type AccountDay, type AccountDetail, type FieldOption, type ManualTrade, type PaperStrategy, type SignalOption, type SnapshotSheet } from './api'
 
@@ -16,13 +16,14 @@ const inputCls =
   'h-8 rounded-btn bg-elevated px-2 text-xs text-foreground border border-border focus:border-primary outline-none'
 
 function StrategyForm({
-  signals, fields, accounts, draft, isNew, setDraft, submit, onTestFields,
+  signals, fields, accounts, draft, isNew, queryLocked, setDraft, submit, onTestFields,
 }: {
   signals: SignalOption[]
   fields: FieldOption[]
   accounts: Account[]
   draft: Partial<PaperStrategy>
   isNew: boolean
+  queryLocked: boolean
   setDraft: (d: Partial<PaperStrategy>) => void
   submit: (newAccount?: { id: string; name: string; initial_cash: number } | null) => void
   onTestFields: (query: string, apiKey?: string) => Promise<FieldOption[]>
@@ -115,10 +116,13 @@ function StrategyForm({
       )}
       <div className="col-span-2 flex flex-col gap-1.5">
         <Field label="问财选股问句（自然语言）">
-          <textarea className="h-16 rounded-btn bg-elevated px-2 py-1 text-xs text-foreground border border-border"
-            value={draft.iwencai_query ?? ''}
+          <textarea className="h-16 rounded-btn bg-elevated px-2 py-1 text-xs text-foreground border border-border disabled:opacity-60"
+            value={draft.iwencai_query ?? ''} disabled={queryLocked}
             onChange={e => update({ iwencai_query: e.target.value })} />
         </Field>
+        {queryLocked && (
+          <div className="text-[11px] text-amber-400">策略已生成落盘数据（问财快照），问句锁定不可修改，保证数据口径一致。</div>
+        )}
         <div className="flex items-center gap-2">
           <button type="button" onClick={runTest} disabled={testing}
             className="inline-flex items-center gap-1 h-7 px-2 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground disabled:opacity-50">
@@ -297,11 +301,16 @@ function StrategyForm({
   )
 }
 
-function AccountDetailPanel({ detail, onEdit, onManualTrade }: {
+function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade }: {
   detail: AccountDetail
+  settleTime?: string
   onEdit: () => void
   onManualTrade: () => void
 }) {
+  // 交易流水默认只看最近 5 笔，展开全部时滚动（上限 max-h-64），面板高度不随流水增长
+  const [allTrades, setAllTrades] = useState(false)
+  const tradeRows = detail.trades.slice().reverse()
+  const shownTrades = allTrades ? tradeRows : tradeRows.slice(0, 5)
   return (
     <div className="rounded-btn border border-border p-4 flex flex-col gap-3">
       <div className="flex items-center justify-between flex-wrap gap-2">
@@ -355,11 +364,19 @@ function AccountDetailPanel({ detail, onEdit, onManualTrade }: {
       </div>
 
       <div>
-        <div className="text-xs font-medium text-secondary mb-1">交易流水</div>
+        <div className="flex items-center justify-between mb-1">
+          <div className="text-xs font-medium text-secondary">交易流水</div>
+          {detail.trades.length > 5 && (
+            <button type="button" onClick={() => setAllTrades(v => !v)}
+              className="text-[11px] text-secondary hover:text-foreground">
+              {allTrades ? '收起（只看最近 5 笔）' : `显示全部 ${detail.trades.length} 笔`}
+            </button>
+          )}
+        </div>
         {detail.trades.length === 0 ? (
-          <div className="text-xs text-muted">暂无成交流水，点击策略卡片「结算」或到定时结算时间后生成。</div>
+          <div className="text-xs text-muted">暂无成交流水，等待定时结算（每日 {settleTime || '…'}）后生成。</div>
         ) : (
-          <div className="overflow-auto max-h-64">
+          <div className={allTrades ? 'overflow-auto max-h-64' : ''}>
             <table className="w-full text-left text-xs">
               <thead>
                 <tr className="text-secondary border-b border-border">
@@ -367,7 +384,7 @@ function AccountDetailPanel({ detail, onEdit, onManualTrade }: {
                 </tr>
               </thead>
               <tbody>
-                {detail.trades.slice().reverse().map((t, i) => (
+                {shownTrades.map((t, i) => (
                   <tr key={i} className="border-b border-border/50">
                     <td className="py-1">{t.date}</td>
                     <td>{t.symbol}</td>
@@ -548,12 +565,11 @@ function HistoryPanelModal({ strategies, initialStrategyId, onClose }: {
   )
 }
 
-function StrategyCard({ s, onOpen, onPatch, onFetch, onSimulate, onDelete, onEditAccount, onManualTrade }: {
+function StrategyCard({ s, onOpen, onPatch, onFetch, onDelete, onEditAccount, onManualTrade }: {
   s: PaperStrategy
   onOpen: () => void
   onPatch: (patch: Partial<PaperStrategy>) => void
   onFetch: () => void | Promise<void>
-  onSimulate: () => void
   onDelete: () => void
   onEditAccount: (accountId: string) => void
   onManualTrade: (account: Account) => void
@@ -565,10 +581,14 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onSimulate, onDelete, onEdi
   useEffect(() => {
     let alive = true
     setDetail(null)
-    if (s.account_id) {
+    const load = () => {
+      if (!s.account_id) return
       paperApi.accountDetail(s.account_id).then(d => alive && setDetail(d)).catch(() => alive && setDetail(null))
     }
-    return () => { alive = false }
+    load()
+    // 持仓现价/收益率按实时行情定时刷新（30s；后端优先走 QuoteService 实时缓存）
+    const timer = setInterval(load, 30_000)
+    return () => { alive = false; clearInterval(timer) }
   }, [s.id, s.account_id])
 
   const todayStr = () => {
@@ -634,16 +654,13 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onSimulate, onDelete, onEdi
         <button onClick={handleFetch} disabled={checking} className="inline-flex items-center gap-1 h-7 px-2 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground hover:bg-elevated/80 disabled:opacity-50">
           <RefreshCw size={12} /> 拉取
         </button>
-        <button onClick={onSimulate} className="inline-flex items-center gap-1 h-7 px-2 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground hover:bg-elevated/80">
-          <Play size={12} /> 结算
-        </button>
         <button onClick={onDelete} className="ml-auto inline-flex items-center gap-1 h-7 px-2 rounded-btn text-xs text-red-400 hover:bg-red-500/10">
           <Trash2 size={12} />
         </button>
       </div>
 
       {detail && (
-        <AccountDetailPanel detail={detail}
+        <AccountDetailPanel detail={detail} settleTime={s.simulate_time}
           onEdit={() => onEditAccount(detail.account.id)}
           onManualTrade={() => onManualTrade(detail.account)} />
       )}
@@ -744,6 +761,7 @@ function PaperPage() {
   const [fields, setFields] = useState<FieldOption[]>([])
   const [formFields, setFormFields] = useState<FieldOption[] | null>(null)
   const [editing, setEditing] = useState<Partial<PaperStrategy> | null>(null)
+  const [queryLocked, setQueryLocked] = useState(false)
   const [msg, setMsg] = useState('')
   const [accEditing, setAccEditing] = useState<Account | null>(null)
   const [accEditDraft, setAccEditDraft] = useState<{ name: string; initial_cash: number } | null>(null)
@@ -769,9 +787,12 @@ function PaperPage() {
   const openEditor = async (s: PaperStrategy | null) => {
     setEditing(s ? { ...s } : {})
     if (s) {
+      // 已生成过问财快照的策略锁定问句不可改（落盘数据按 strategy_id 隔离, 口径需一致）
+      try { setQueryLocked((await paperApi.latest(s.id)).date != null) }
+      catch { setQueryLocked(false) }
       try { const opt = await paperApi.options(s.id); setFormFields(opt.fields) }
       catch { setFormFields(null) }
-    } else setFormFields(null)
+    } else { setFormFields(null); setQueryLocked(false) }
   }
   // 「测试问财并获取字段」回调：实时调问财获取动态字段（合并交给表单内部做）
   const testFields = async (query: string, apiKey?: string): Promise<FieldOption[]> => {
@@ -880,7 +901,6 @@ function PaperPage() {
             onOpen={() => openEdit(s)}
             onPatch={patch => onPatchStrategy(s.id, patch)}
             onFetch={() => act(() => paperApi.fetchNow(s.id), `已拉取选股：${s.name}`)}
-            onSimulate={() => act(() => paperApi.simulateNow(s.id), `已结算：${s.name}`)}
             onDelete={() => removeStrategy(s)}
             onEditAccount={openAccountEdit}
             onManualTrade={openManualTrade} />
@@ -894,7 +914,7 @@ function PaperPage() {
             <button onClick={closeEditor} className="text-xs text-secondary hover:text-foreground">× 关闭</button>
           </div>
           <StrategyForm signals={signals} fields={formFields ?? fields} accounts={accounts} draft={editing}
-            isNew={isNew} setDraft={setEditing} submit={saveStrategy} onTestFields={testFields} />
+            isNew={isNew} queryLocked={queryLocked} setDraft={setEditing} submit={saveStrategy} onTestFields={testFields} />
         </div>
       )}
 
