@@ -67,7 +67,8 @@ def decide_exit(strategy: PaperStrategy, pos: Position,
                 row: DayRow | None, date: str) -> str | None:
     """按卖出规则判定是否离场，返回原因；不离开场则 None。
 
-    止损/止盈按当日盘中触及判定（low/high 碰到成本×线位即触发），
+    止损/止盈按当日盘中触及判定（low/high 碰到线价即触发）：
+    成本价线 = avg_cost × (1 + pct)；前收线 = prev_close × (1 + prev_close_pct)。
     信号与持股天数按结算日状态判定。
     """
     rule = strategy.sell_rule
@@ -83,8 +84,18 @@ def decide_exit(strategy: PaperStrategy, pos: Position,
     if rule.take_profit_pct is not None and high >= pos.avg_cost * (1 + rule.take_profit_pct):
         return "take_profit"
 
+    if rule.take_profit_prev_close_pct is not None \
+            and row.prev_close is not None and row.prev_close > 0 \
+            and high >= row.prev_close * (1 + rule.take_profit_prev_close_pct):
+        return "take_profit_prev"
+
     if rule.stop_loss_pct is not None and low <= pos.avg_cost * (1 + rule.stop_loss_pct):
         return "stop_loss"
+
+    if rule.stop_loss_prev_close_pct is not None \
+            and row.prev_close is not None and row.prev_close > 0 \
+            and low <= row.prev_close * (1 + rule.stop_loss_prev_close_pct):
+        return "stop_loss_prev"
 
     if rule.max_hold_days is not None and pos.hold_days >= rule.max_hold_days:
         return "max_hold"
@@ -127,9 +138,10 @@ def _fill_pending(market: MarketData, account: Account, strategy: PaperStrategy,
 def _exit_fill_price(rule, pos: Position, row: DayRow, reason: str) -> float:
     """按退出原因确定成交价。
 
-    - stop_loss / take_profit: 按触发线价成交（成本×线位）。开盘跳空穿越
-      线位时按开盘价成交（跳空低开止损成交更低、跳空高开止盈成交更高，
-      与真实限价单/市价单行为一致，避免按线价凭空乐观/悲观）。
+    - stop_loss / stop_loss_prev / take_profit / take_profit_prev:
+      按触发线价成交（成本×线位 / 前收×线位）。开盘跳空穿越线位时按开盘价
+      成交（跳空低开止损成交更低、跳空高开止盈成交更高，与真实限价单/市价单
+      行为一致，避免按线价凭空乐观/悲观）。
     - 其他（信号/持股天数）: sell_time 决定 —— open=结算日开盘价
       （持股天数=1 时即次日开盘卖出），close=结算日收盘价。
     """
@@ -137,8 +149,16 @@ def _exit_fill_price(rule, pos: Position, row: DayRow, reason: str) -> float:
     if reason == "stop_loss" and rule.stop_loss_pct is not None:
         line = pos.avg_cost * (1 + rule.stop_loss_pct)
         return min(open_px, line)
+    if reason == "stop_loss_prev" and rule.stop_loss_prev_close_pct is not None \
+            and row.prev_close is not None and row.prev_close > 0:
+        line = row.prev_close * (1 + rule.stop_loss_prev_close_pct)
+        return min(open_px, line)
     if reason == "take_profit" and rule.take_profit_pct is not None:
         line = pos.avg_cost * (1 + rule.take_profit_pct)
+        return max(open_px, line)
+    if reason == "take_profit_prev" and rule.take_profit_prev_close_pct is not None \
+            and row.prev_close is not None and row.prev_close > 0:
+        line = row.prev_close * (1 + rule.take_profit_prev_close_pct)
         return max(open_px, line)
     return open_px if rule.sell_time == "open" else row.close
 
@@ -205,8 +225,11 @@ def _generate_buys(account: Account, strategy: PaperStrategy, candidates: list[s
                    market: MarketData | None = None) -> list[TradeRecord]:
     """按买入规则生成买入并返回当日产生的买入成交。
 
+    本函数在卖出之后执行（见 process_day），当日卖出释放的资金与仓位额度
+    立即可用于再买入（滚仓）：总仓位预算按卖出后的持仓计算。
     排序：按 sort_field 的归一化数值升/降序（缺失值排末尾）；再取 top_n。
-    仓位：单股受 max_position_pct 限制；总投入（持仓+待买入）受 max_total_pct 上限。
+    仓位：单股受 max_position_pct 限制（按总资产口径）；总投入（持仓+待买入）
+    受 max_total_pct 上限（0=不限制，仅受现金约束）。
     成交时点：next_open → 生成待买入单（次日开盘成交，成交时再检查可买性）；
     same_open → 当日立即用开盘价买入（开盘涨停/一字板/停牌不可买，跳过）。
     """
@@ -248,14 +271,20 @@ def _generate_buys(account: Account, strategy: PaperStrategy, candidates: list[s
     def pos_value(sym: str, pos) -> float:
         r = rows.get(sym)
         return (r.close or 0.0) * pos.qty if r and r.close else pos.qty * pos.avg_cost
+
+    def pending_value(order: PendingOrder) -> float:
+        """待买入单按当日收盘价预估占用；无当日行情（停牌等）按 0 计（成交日再受现金约束）。"""
+        r = rows.get(order.symbol)
+        return (r.close or 0.0) * order.qty if r and r.close else 0.0
+
     total_value = account.cash + sum(pos_value(s, p) for s, p in account.positions.items())
     committed = sum(pos_value(s, p) for s, p in account.positions.items())
-    committed += sum(pos_value(o.symbol, o) for o in account.pending)
+    committed += sum(pending_value(o) for o in account.pending)
     # 总仓位预算：现金或 max_total_pct*总资产 扣除已投入后的余额
     total_budget = account.cash if not (rule.max_total_pct and rule.max_total_pct > 0) \
         else max(0.0, total_value * rule.max_total_pct - committed)
 
-    per_budget = min(account.cash / len(picked), account.cash * rule.max_position_pct)
+    per_budget = min(account.cash / len(picked), total_value * rule.max_position_pct)
     buys: list[TradeRecord] = []
     for sym in picked:
         if account.cash <= 0 or total_budget <= 0:

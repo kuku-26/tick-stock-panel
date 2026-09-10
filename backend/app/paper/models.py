@@ -143,6 +143,10 @@ class SellRule:
     exit_signal_ids: 持仓日任一成立即离场（OR）。
     stop_loss_pct / take_profit_pct: 相对持仓成本价的止损/止盈（如 -0.08 = 亏8%止损）。
         触发判定按当日盘中触及（low/high 碰到线价），成交也按线价（见 trading._sell_positions）。
+    stop_loss_prev_close_pct / take_profit_prev_close_pct: 相对前一交易日收盘价的
+        止损/止盈（如 -0.05 = 跌破前收5%止损, +0.05 = 涨过前收5%止盈）。
+        线价 = 前收 × (1 + pct)；触发按盘中 low/high 触及，成交按线价（跳空穿越按开盘价，
+        同成本价止损/止盈）。与成本价线可同时配置，任一触发即卖。
     max_hold_days: 最长持有交易日数，超期卖出。None=不限制。1 = 买入次日卖出。
     sell_time: 信号/持股天数退出的成交时点。close=结算日收盘价（默认）；
         open=结算日开盘价（持股天数=1 时即"次日开盘卖出"）。止损/止盈始终按线价成交。
@@ -150,7 +154,9 @@ class SellRule:
 
     exit_signal_ids: list[str] = field(default_factory=list)
     stop_loss_pct: float | None = None
+    stop_loss_prev_close_pct: float | None = None
     take_profit_pct: float | None = None
+    take_profit_prev_close_pct: float | None = None
     max_hold_days: int | None = None
     sell_time: str = "close"
 
@@ -179,14 +185,18 @@ class SellRule:
             raise ValueError("sell_time 只能是 close 或 open")
         return cls(exit_signal_ids=list(sigs),
                    stop_loss_pct=_ratio("stop_loss_pct"),
+                   stop_loss_prev_close_pct=_ratio("stop_loss_prev_close_pct"),
                    take_profit_pct=_ratio("take_profit_pct"),
+                   take_profit_prev_close_pct=_ratio("take_profit_prev_close_pct"),
                    max_hold_days=hold,
                    sell_time=stime)
 
     def to_dict(self) -> dict[str, Any]:
         return {"exit_signal_ids": self.exit_signal_ids,
                 "stop_loss_pct": self.stop_loss_pct,
+                "stop_loss_prev_close_pct": self.stop_loss_prev_close_pct,
                 "take_profit_pct": self.take_profit_pct,
+                "take_profit_prev_close_pct": self.take_profit_prev_close_pct,
                 "max_hold_days": self.max_hold_days,
                 "sell_time": self.sell_time}
 

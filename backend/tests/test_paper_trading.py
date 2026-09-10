@@ -13,7 +13,8 @@ from app.paper.models import (Account, BuyRule, PaperStrategy, SellRule,
 from app.paper.scheduler import PaperScheduler, _simulate
 from app.paper.service import MarketDataNotReadyError, run_simulate
 from app.paper.store import PaperStore
-from app.paper.trading import decide_exit, entry_signal_passes, process_day
+from app.paper.trading import (_exit_fill_price, decide_exit,
+                               entry_signal_passes, process_day)
 
 
 class FakeMarket:
@@ -94,6 +95,66 @@ def test_exit_reasons():
     # 最长持有
     assert decide_exit(s, dataclasses.replace(pos, **{"hold_days": 3}),
                        r("000001", 10, 11), "2026-01-02") == "max_hold"
+
+
+def test_exit_prev_close_stop_loss():
+    """止损-前收: 盘中 low 触及 前收×(1+pct) 即触发; 无前收则不判定该条件。"""
+    s = make_strategy()
+    s.sell_rule = SellRule(stop_loss_prev_close_pct=-0.05)
+    pos = Position("000001", 100, 10, "2026-01-01", hold_days=0)
+    # prev_close=10 → 线 9.5; low 9.4 触及触发
+    assert decide_exit(s, pos, r("000001", 9.6, 9.45, low=9.4, prev_close=10.0),
+                       "2026-01-02") == "stop_loss_prev"
+    # low 9.6 未触及线 9.5
+    assert decide_exit(s, pos, r("000001", 9.8, 9.7, low=9.6, prev_close=10.0),
+                       "2026-01-02") is None
+    # 无前收（prev_close 缺失/非正）→ 该条件不判定
+    assert decide_exit(s, pos, r("000001", 9.0, 9.0, low=9.0), "2026-01-02") is None
+    assert decide_exit(s, pos, r("000001", 9.0, 9.0, low=9.0, prev_close=0),
+                       "2026-01-02") is None
+
+
+def test_exit_prev_close_fill_price():
+    """止损-前收按线价成交, 开盘跳空穿越线位时按开盘价成交。"""
+    rule = SellRule(stop_loss_prev_close_pct=-0.05)
+    s = make_strategy()
+    s.sell_rule = rule
+    pos = Position("000001", 100, 10, "2026-01-01")
+    # 盘中触发: 开盘 9.7 高于线 9.5 → 按线价 9.5 成交
+    assert _exit_fill_price(rule, pos, r("000001", 9.7, 9.4, low=9.4, prev_close=10.0),
+                            "stop_loss_prev") == pytest.approx(9.5)
+    # 跳空低开穿越线位: 开盘 9.2 → 按开盘价 9.2 成交
+    assert _exit_fill_price(rule, pos, r("000001", 9.2, 9.1, low=9.1, prev_close=10.0),
+                            "stop_loss_prev") == pytest.approx(9.2)
+
+
+def test_exit_prev_close_take_profit():
+    """止盈-前收: 盘中 high 触及 前收×(1+pct) 即触发; 无前收则不判定该条件。"""
+    s = make_strategy()
+    s.sell_rule = SellRule(take_profit_prev_close_pct=0.05)
+    pos = Position("000001", 100, 10, "2026-01-01", hold_days=0)
+    # prev_close=10 → 线 10.5; high 10.6 触及触发
+    assert decide_exit(s, pos, r("000001", 10.2, 10.5, high=10.6, prev_close=10.0),
+                       "2026-01-02") == "take_profit_prev"
+    # high 10.4 未触及线 10.5
+    assert decide_exit(s, pos, r("000001", 10.1, 10.3, high=10.4, prev_close=10.0),
+                       "2026-01-02") is None
+    # 无前收（prev_close 缺失/非正）→ 该条件不判定
+    assert decide_exit(s, pos, r("000001", 10.8, 10.9, high=10.9), "2026-01-02") is None
+    assert decide_exit(s, pos, r("000001", 10.8, 10.9, high=10.9, prev_close=0),
+                       "2026-01-02") is None
+
+
+def test_exit_prev_close_take_profit_fill_price():
+    """止盈-前收按线价成交, 开盘跳空高开穿越线位时按开盘价成交。"""
+    rule = SellRule(take_profit_prev_close_pct=0.05)
+    pos = Position("000001", 100, 10, "2026-01-01")
+    # 盘中触发: 开盘 10.2 低于线 10.5 → 按线价 10.5 成交
+    assert _exit_fill_price(rule, pos, r("000001", 10.2, 10.6, high=10.6, prev_close=10.0),
+                            "take_profit_prev") == pytest.approx(10.5)
+    # 跳空高开穿越线位: 开盘 10.8 → 按开盘价 10.8 成交
+    assert _exit_fill_price(rule, pos, r("000001", 10.8, 10.9, high=10.9, prev_close=10.0),
+                            "take_profit_prev") == pytest.approx(10.8)
 
 
 def test_exit_signal_or_rule():
@@ -633,6 +694,68 @@ def test_max_hold_days_1_sells_next_open():
     assert len(sells) == 1 and sells[0].reason == "max_hold"
     assert sells[0].price == pytest.approx(10.7), "持股天数=1 应在次日以开盘价卖出"
     assert not acct.positions
+
+
+def test_roll_after_sell_same_day():
+    """滚仓: 结算先卖后买, 当日卖出释放的资金与仓位额度同日即可再买入新标的。
+
+    Day1 建仓 2 只（总仓位上限 0.5, 单股上限 0.2, same_open 买入）;
+    Day2 max_hold_days=1 触发全部卖出(sell_time=open), 同日应能买入 2 只新标的。
+    """
+    mk = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 10, 10), "000002": r("000002", 20, 20)},
+        "2026-01-03": {"000001": r("000001", 10, 10), "000002": r("000002", 20, 20),
+                       "000003": r("000003", 10, 10), "000004": r("000004", 20, 20)},
+    })
+    acct = make_account(cash=10000)
+    s = make_strategy()
+    s.buy_rule.max_total_pct = 0.5
+    s.buy_rule.max_position_pct = 0.2
+    s.buy_rule.buy_time = "same_open"
+    s.sell_rule = SellRule(max_hold_days=1, sell_time="open")
+    process_day(mk, acct, s, "2026-01-02", candidates=["000001", "000002"])
+    assert len(acct.positions) == 2
+    trades, _ = process_day(mk, acct, s, "2026-01-03", candidates=["000003", "000004"])
+    sells = [t for t in trades if t.side == "sell"]
+    buys = [t for t in trades if t.side == "buy"]
+    assert len(sells) == 2 and len(buys) == 2, "卖出释放额度后同日应能再买入新标的"
+    assert {b.symbol for b in buys} == {"000003", "000004"}
+    # 再买入总额不超过总仓位上限 (0.5 × 总资产 10000 = 5000)
+    assert sum(b.amount for b in buys) <= 5000 + 1e-6
+
+
+def test_partial_sell_frees_quota_for_rebuy():
+    """部分卖出同样释放额度: 卖 1 只后, 剩余持仓 + 新买入 ≤ 总仓位上限。
+
+    单股上限按总资产口径: 卖出释放资金后, 新买单可按 max_position_pct × 总资产 全额配置。
+    """
+    mk = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 10, 10), "000002": r("000002", 20, 20)},
+        "2026-01-03": {"000001": r("000001", 10, 10), "000002": r("000002", 20, 20),
+                       "000003": r("000003", 10, 10)},
+        # 000001 止损: prev_close 10, 线 9.5, low 9.4 触发
+        "2026-01-04": {"000001": r("000001", 9.7, 9.3, low=9.4, prev_close=10.0),
+                       "000002": r("000002", 20, 20),
+                       "000003": r("000003", 10, 10)},
+    })
+    acct = make_account(cash=10000)
+    s = make_strategy()
+    s.buy_rule.max_total_pct = 0.5
+    s.buy_rule.max_position_pct = 0.2
+    s.buy_rule.buy_time = "same_open"
+    s.sell_rule = SellRule(stop_loss_prev_close_pct=-0.05, max_hold_days=5)
+    process_day(mk, acct, s, "2026-01-02", candidates=["000001", "000002"])
+    process_day(mk, acct, s, "2026-01-03", candidates=[])
+    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=["000003"])
+    sells = [t for t in trades if t.side == "sell"]
+    buys = [t for t in trades if t.side == "buy"]
+    assert len(sells) == 1 and sells[0].symbol == "000001"
+    assert len(buys) == 1 and buys[0].symbol == "000003", "止损卖出释放的额度应可同日再买入"
+    # 总投入不超过 0.5 × 总资产
+    total_value = acct.cash + sum(
+        p.qty * (10 if p.symbol == "000003" else 20) for p in acct.positions.values())
+    invested = total_value - acct.cash
+    assert invested <= total_value * 0.5 + 1e-6
 
 
 def test_exit_signal_sell_time_open():

@@ -3,6 +3,18 @@ import { LineChart, Wallet, Save, Trash2, RefreshCw, Settings2, Loader2, Plus, P
 import type { FrontendExtension } from '@/extensions/types'
 import { paperApi, type Account, type AccountDay, type AccountDetail, type FieldOption, type ManualTrade, type PaperStrategy, type SignalOption, type SnapshotSheet } from './api'
 
+// 交易原因代码 → 中文展示（后端代码保持稳定，历史流水兼容）
+const REASON_LABELS: Record<string, string> = {
+  entry_fill: '按策略买入',
+  exit_signal: '卖出信号',
+  stop_loss: '止损',
+  stop_loss_prev: '止损(前收)',
+  take_profit: '止盈',
+  take_profit_prev: '止盈(前收)',
+  max_hold: '持有到期',
+  manual: '手动交易',
+}
+
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="flex flex-col gap-1 text-xs text-secondary">
@@ -38,7 +50,7 @@ function StrategyForm({
   const [testing, setTesting] = useState(false)
   const [testErr, setTestErr] = useState('')
   const buyRule = draft.buy_rule ?? { signal_ids: [], iwencai_filters: [], sort_field: '', sort_order: 'desc', top_n: 0, max_position_pct: 0.2, max_total_pct: 0, max_symbols: 0, buy_time: 'next_open' }
-  const sellRule = draft.sell_rule ?? { exit_signal_ids: [], stop_loss_pct: null, take_profit_pct: null, max_hold_days: null, sell_time: 'close' }
+  const sellRule = draft.sell_rule ?? { exit_signal_ids: [], stop_loss_pct: null, stop_loss_prev_close_pct: null, take_profit_pct: null, take_profit_prev_close_pct: null, max_hold_days: null, sell_time: 'close' }
   // 预览/快照字段在前、内置字段兜底，去重
   const effFields: FieldOption[] = []
   for (const f of [...dynFields, ...fields]) if (!effFields.some(x => x.key === f.key)) effFields.push(f)
@@ -265,10 +277,20 @@ function StrategyForm({
               value={sellRule.stop_loss_pct ?? ''}
               onChange={e => setDraft({ ...draft, sell_rule: { ...sellRule, stop_loss_pct: e.target.value === '' ? null : Number(e.target.value) } })} />
           </Field>
+          <Field label="止损-前收(%)">
+            <input className={inputCls} type="number" step="0.01"
+              value={sellRule.stop_loss_prev_close_pct ?? ''}
+              onChange={e => setDraft({ ...draft, sell_rule: { ...sellRule, stop_loss_prev_close_pct: e.target.value === '' ? null : Number(e.target.value) } })} />
+          </Field>
           <Field label="止盈(%)">
             <input className={inputCls} type="number" step="0.01"
               value={sellRule.take_profit_pct ?? ''}
               onChange={e => setDraft({ ...draft, sell_rule: { ...sellRule, take_profit_pct: e.target.value === '' ? null : Number(e.target.value) } })} />
+          </Field>
+          <Field label="止盈-前收(%)">
+            <input className={inputCls} type="number" step="0.01"
+              value={sellRule.take_profit_prev_close_pct ?? ''}
+              onChange={e => setDraft({ ...draft, sell_rule: { ...sellRule, take_profit_prev_close_pct: e.target.value === '' ? null : Number(e.target.value) } })} />
           </Field>
           <Field label="最长持有(日,空=不限)">
             <input className={inputCls} type="number" min="1"
@@ -289,7 +311,10 @@ function StrategyForm({
             ))}
           </div>
         )}
-        <div className="text-[11px] text-muted">止损/止盈为小数制，如 -0.08 表示亏损 8% 止损、0.3 表示盈利 30% 止盈。</div>
+        <div className="text-[11px] text-muted">
+          止损/止盈为小数制，如 -0.08 表示亏损 8% 止损、0.3 表示盈利 30% 止盈；止损/止盈-前收相对前一交易日收盘价，
+          如 -0.05 表示跌破前收 5% 止损、0.05 表示涨过前收 5% 止盈，多者可同时配置、任一触发即卖。
+        </div>
       </div>
 
       <button type="button"
@@ -345,7 +370,7 @@ function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade }: {
         <span>结算 {detail.days.length} 天</span>
       </div>
 
-      <BalanceCurve days={detail.days} liveNav={liveNav} />
+      <BalanceCurve days={detail.days} liveNav={liveNav} initialCash={detail.account.initial_cash} />
 
       <div>
         <div className="text-xs font-medium text-secondary mb-1">持仓股</div>
@@ -405,7 +430,7 @@ function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade }: {
                     <td className={t.side === 'buy' ? 'text-red-300' : 'text-emerald-300'}>{t.side === 'buy' ? '买入' : '卖出'}</td>
                     <td>{t.qty}</td><td>{t.price}</td>
                     <td>{t.amount?.toLocaleString()}</td>
-                    <td className="text-muted">{t.reason}</td>
+                    <td className="text-muted">{REASON_LABELS[t.reason] ? `${REASON_LABELS[t.reason]}(${t.reason})` : t.reason}</td>
                   </tr>
                 ))}
               </tbody>
@@ -701,7 +726,7 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onDelete, onEditAccount, on
   )
 }
 
-function BalanceCurve({ days, liveNav }: { days: AccountDay[]; liveNav: number | null }) {
+function BalanceCurve({ days, liveNav, initialCash }: { days: AccountDay[]; liveNav: number | null; initialCash?: number | null }) {
   // 净值 nav(初始=1.0) → 累计收益率(%)。结算点来自每日定时结算落盘;
   // 末尾可追加"实时"点(与持仓表同一份实时价), 使曲线终点与持仓收益对齐
   const toNum = (v: number | null | undefined) => (typeof v === 'number' ? v : null)
@@ -741,8 +766,27 @@ function BalanceCurve({ days, liveNav }: { days: AccountDay[]; liveNav: number |
   const firstDate = shortDate(days[0]?.date)
   const lastDate = shortDate(days[days.length - 1]?.date)
   const settledCount = settled.filter((v): v is number => v !== null).length
+  // 收益金额 = 累计收益率 × 初始资金（与曲线最新点同口径，含实时浮动）
+  const profitAmt = typeof initialCash === 'number' && initialCash > 0 ? last / 100 * initialCash : null
   return (
     <div className="flex flex-col gap-1">
+      {/* 同花顺账户页风格: 图表上方大字显示累计收益率与收益金额 */}
+      <div className="flex items-end gap-5">
+        <div>
+          <div className="text-[11px] text-muted">累计收益率{liveX !== null ? '（实时）' : ''}</div>
+          <div className={`text-base font-semibold leading-tight ${last >= 0 ? 'text-red-300' : 'text-emerald-300'}`}>
+            {last >= 0 ? '+' : ''}{last.toFixed(2)}%
+          </div>
+        </div>
+        {profitAmt !== null && (
+          <div>
+            <div className="text-[11px] text-muted">收益金额</div>
+            <div className={`text-base font-semibold leading-tight ${last >= 0 ? 'text-red-300' : 'text-emerald-300'}`}>
+              {last >= 0 ? '+' : ''}{profitAmt.toFixed(2)}
+            </div>
+          </div>
+        )}
+      </div>
       <div className="text-xs font-medium text-secondary">收益率曲线</div>
       <div className="flex gap-1">
         {/* y 轴刻度（HTML 标签避免 svg 拉伸变形） */}
@@ -770,10 +814,7 @@ function BalanceCurve({ days, liveNav }: { days: AccountDay[]; liveNav: number |
       <div className="flex gap-4 text-[11px] text-secondary">
         <span className="flex items-center gap-1">
           <i className="h-0.5 w-3 inline-block" style={{ background: color }} />
-          累计收益率 <b className={last >= 0 ? 'text-red-300' : 'text-emerald-300'}>
-            {last >= 0 ? '+' : ''}{last.toFixed(2)}%
-          </b>
-          {liveX !== null && <span className="text-muted">（实时）</span>}
+          收益率曲线
         </span>
         <span>结算 {settledCount} 天</span>
       </div>

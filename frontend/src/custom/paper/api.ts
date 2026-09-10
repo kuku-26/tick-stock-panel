@@ -49,7 +49,9 @@ export interface BuyRule {
 export interface SellRule {
   exit_signal_ids: string[]
   stop_loss_pct: number | null
+  stop_loss_prev_close_pct: number | null
   take_profit_pct: number | null
+  take_profit_prev_close_pct: number | null
   max_hold_days: number | null
   sell_time: string
 }
