@@ -293,13 +293,16 @@ class PaperStrategy:
     # 调度：交易日期可选（工作日自动跳过周末；节假日由数据缺失自然跳过）
     fetch_time: str = "09:25"
     simulate_time: str = "15:30"
+    # 创建日期（YYYY-MM-DD）；历史策略由 store 加载时按最早落盘日期回填
+    created_at: str | None = None
 
     @classmethod
     def create(cls, strategy_id: str, name: str, account_id: str,
                iwencai_query: str, api_key: str = "") -> PaperStrategy:
         return cls(id=validate_id(strategy_id, "策略id"),
                    name=name, account_id=account_id,
-                   iwencai_query=iwencai_query, api_key=api_key)
+                   iwencai_query=iwencai_query, api_key=api_key,
+                   created_at=time.strftime("%Y-%m-%d"))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -308,6 +311,7 @@ class PaperStrategy:
             "enabled": self.enabled, "buy_rule": self.buy_rule.to_dict(),
             "sell_rule": self.sell_rule.to_dict(),
             "fetch_time": self.fetch_time, "simulate_time": self.simulate_time,
+            "created_at": self.created_at,
         }
 
     @classmethod
@@ -323,6 +327,7 @@ class PaperStrategy:
             sell_rule=SellRule.from_dict(d.get("sell_rule")),
             fetch_time=str(d.get("fetch_time", "09:25")),
             simulate_time=str(d.get("simulate_time", "15:30")),
+            created_at=(str(d["created_at"]) if d.get("created_at") else None),
         )
 
 

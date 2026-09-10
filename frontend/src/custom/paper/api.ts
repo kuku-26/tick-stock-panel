@@ -68,6 +68,7 @@ export interface PaperStrategy {
   sell_rule: SellRule
   fetch_time: string
   simulate_time: string
+  created_at?: string | null
 }
 
 export interface ManualTrade {

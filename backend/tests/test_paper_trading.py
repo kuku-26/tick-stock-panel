@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import pytest
 
@@ -63,6 +64,28 @@ def make_strategy(**kw):
                     iwencai_query="query")
     defaults.update(kw)
     return PaperStrategy.create(**defaults)
+
+
+def test_strategy_created_at_backfill(tmp_path):
+    """created_at: 新建策略取今天; 历史记录(无 created_at)按最早落盘日期回填并持久化。"""
+    from app.paper.store import PaperStore
+    store = PaperStore(tmp_path)
+    s = make_strategy()
+    assert s.created_at, "create() 应写入创建日期"
+    store.save_strategies({"strat1": s})
+    strat_file = tmp_path / "paper" / "strategies.json"
+    # 模拟历史数据: 抹掉 created_at, 最早每日快照为 2026-01-02
+    raw = json.loads(strat_file.read_text(encoding="utf-8"))
+    raw[0].pop("created_at")
+    strat_file.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    (tmp_path / "paper" / "days" / "2026-01-02").mkdir(parents=True)
+    (tmp_path / "paper" / "days" / "2026-01-02" / "strat1.json").write_text("{}", encoding="utf-8")
+    loaded = store.load_strategies()
+    assert loaded["strat1"].created_at == "2026-01-02", "应按最早落盘日期回填"
+    # 回填结果已持久化, 二次加载稳定
+    again = json.loads(strat_file.read_text(encoding="utf-8"))
+    assert again[0]["created_at"] == "2026-01-02"
+    assert store.load_strategies()["strat1"].created_at == "2026-01-02"
 
 
 # ── 信号求值 ────────────────────────────────────────────

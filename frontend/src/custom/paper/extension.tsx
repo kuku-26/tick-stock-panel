@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
-import { LineChart, Wallet, Save, Trash2, RefreshCw, Settings2, Loader2, Plus, Pencil, History } from 'lucide-react'
+import { ChevronDown, ChevronUp, LineChart, Wallet, Save, Trash2, RefreshCw, Settings2, Loader2, Plus, Pencil, History } from 'lucide-react'
 import type { FrontendExtension } from '@/extensions/types'
-import { paperApi, type Account, type AccountDay, type AccountDetail, type FieldOption, type ManualTrade, type PaperStrategy, type SignalOption, type SnapshotSheet } from './api'
+import { paperApi, type Account, type AccountDay, type AccountDetail, type BuyRule, type FieldOption, type ManualTrade, type PaperStrategy, type SellRule, type SignalOption, type SnapshotSheet } from './api'
 
 // 交易原因代码 → 中文展示（后端代码保持稳定，历史流水兼容）
 const REASON_LABELS: Record<string, string> = {
@@ -13,6 +13,47 @@ const REASON_LABELS: Record<string, string> = {
   take_profit_prev: '止盈(前收)',
   max_hold: '持有到期',
   manual: '手动交易',
+}
+
+const pctTxt = (v: number | null | undefined) =>
+  (v === null || v === undefined ? null : `${Math.round(v * 100)}%`)
+const signedPctTxt = (v: number | null | undefined) =>
+  (v === null || v === undefined ? null : `${v > 0 ? '+' : ''}${Math.round(v * 100)}%`)
+
+function buySummary(br: BuyRule): string {
+  const parts: string[] = [br.top_n > 0 ? `Top${br.top_n}` : 'Top不限']
+  if (br.sort_field) parts.push(`${br.sort_field} ${br.sort_order === 'asc' ? '↑' : '↓'}`)
+  const single = pctTxt(br.max_position_pct)
+  if (single) {
+    const total = br.max_total_pct && br.max_total_pct > 0 ? pctTxt(br.max_total_pct) : '不限'
+    parts.push(`单股${single}/总${total}`)
+  }
+  parts.push(br.buy_time === 'same_open' ? '当日开盘买' : '次日开盘买')
+  if (br.max_symbols > 0) parts.push(`日限${br.max_symbols}只`)
+  return parts.join(' · ')
+}
+
+function sellSummary(sr: SellRule): string {
+  const parts: string[] = []
+  const sl = signedPctTxt(sr.stop_loss_pct)
+  if (sl) parts.push(`止损${sl}`)
+  const slp = signedPctTxt(sr.stop_loss_prev_close_pct)
+  if (slp) parts.push(`前收止损${slp}`)
+  const tp = signedPctTxt(sr.take_profit_pct)
+  if (tp) parts.push(`止盈${tp}`)
+  const tpp = signedPctTxt(sr.take_profit_prev_close_pct)
+  if (tpp) parts.push(`前收止盈${tpp}`)
+  if (sr.max_hold_days) parts.push(`持有${sr.max_hold_days}日`)
+  if (sr.exit_signal_ids?.length) parts.push(`信号退出×${sr.exit_signal_ids.length}`)
+  parts.push(sr.sell_time === 'open' ? '开盘卖' : '收盘卖')
+  return parts.join(' · ')
+}
+
+function runDays(created?: string | null): number | null {
+  if (!created) return null
+  const t = new Date(created)
+  if (isNaN(t.getTime())) return null
+  return Math.max(0, Math.floor((Date.now() - t.getTime()) / 86_400_000))
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
@@ -614,6 +655,7 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onDelete, onEditAccount, on
 }) {
   const [detail, setDetail] = useState<AccountDetail | null>(null)
   const [showSheet, setShowSheet] = useState(false)
+  const [showDetail, setShowDetail] = useState(true)
   const [confirmFetch, setConfirmFetch] = useState<{ latest: string | null } | null>(null)
   const [checking, setChecking] = useState(false)
   useEffect(() => {
@@ -669,8 +711,15 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onDelete, onEditAccount, on
         </label>
       </div>
       <div className="text-xs text-muted">问句：{s.iwencai_query}</div>
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-secondary leading-relaxed">
+        <span><span className="text-muted">买：</span>{buySummary(s.buy_rule)}</span>
+        <span><span className="text-muted">卖：</span>{sellSummary(s.sell_rule)}</span>
+      </div>
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-secondary">
         <span>账户：{s.account_name || s.account_id}</span>
+        {s.created_at && (
+          <span>创建：{s.created_at}{runDays(s.created_at) !== null ? ` · 运行 ${runDays(s.created_at)} 天` : ''}</span>
+        )}
         <span className="flex items-center gap-1">
           选股
           <input type="time" className={`${inputCls} w-[92px]`} value={s.fetch_time}
@@ -686,6 +735,12 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onDelete, onEditAccount, on
         <button onClick={onOpen} className="inline-flex items-center gap-1 h-7 px-2 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground hover:bg-elevated/80">
           <Settings2 size={12} /> 编辑
         </button>
+        <button onClick={() => setShowDetail(v => !v)}
+          className="inline-flex items-center gap-1 h-7 px-2 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground hover:bg-elevated/80"
+          title={showDetail ? '收起账户详情' : '展开账户详情'}>
+          {showDetail ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+          {showDetail ? '收起详情' : '账户详情'}
+        </button>
         <button onClick={() => setShowSheet(true)} className="inline-flex items-center gap-1 h-7 px-2 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground hover:bg-elevated/80">
           <LineChart size={12} /> 选股名单
         </button>
@@ -697,7 +752,7 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onDelete, onEditAccount, on
         </button>
       </div>
 
-      {detail && (
+      {showDetail && detail && (
         <AccountDetailPanel detail={detail} settleTime={s.simulate_time}
           onEdit={() => onEditAccount(detail.account.id)}
           onManualTrade={() => onManualTrade(detail.account)} />

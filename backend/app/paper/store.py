@@ -71,7 +71,26 @@ class PaperStore:
                     logger.warning("skip bad strategy record: %s", e)
                     continue
                 out[strat.id] = strat
+        if any(not s.created_at for s in out.values()):
+            self._backfill_created_at(out)
         return out
+
+    def _backfill_created_at(self, strategies: dict[str, PaperStrategy]) -> None:
+        """历史策略无 created_at：按该策略最早落盘日期（每日快照/选股快照）回填，
+        无任何落盘记录则取今天。回填一次后立即持久化。"""
+        import datetime
+        changed = False
+        for sid, strat in strategies.items():
+            if strat.created_at:
+                continue
+            dates = [d.name for d in self._days.glob("*")
+                     if d.is_dir() and (d / f"{sid}.json").exists()]
+            dates += [d.name for d in self._snap.glob("*")
+                      if d.is_dir() and (d / f"{sid}.json").exists()]
+            strat.created_at = min(dates) if dates else datetime.date.today().isoformat()
+            changed = True
+        if changed:
+            self.save_strategies(strategies)
 
     def save_strategies(self, strategies: dict[str, PaperStrategy]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
