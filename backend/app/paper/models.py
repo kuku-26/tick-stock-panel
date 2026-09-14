@@ -93,6 +93,9 @@ class BuyRule:
     max_total_pct: float = 0.0
     max_symbols: int = 0
     buy_time: str = "next_open"
+    # 开盘封涨停但盘中打开（低点<涨停价）时按涨停价（排队价）买入；默认关闭。
+    # 需要当日完整盘口数据，开启时结算时间必须在盘后（15:00 之后）。
+    buy_limit_up_open: bool = False
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> BuyRule:
@@ -123,7 +126,8 @@ class BuyRule:
                    sort_field=str(d.get("sort_field", "")),
                    sort_order=order, top_n=top,
                    max_position_pct=max_pct, max_total_pct=max_tot,
-                   max_symbols=max_sym, buy_time=str(d.get("buy_time", "next_open")))
+                   max_symbols=max_sym, buy_time=str(d.get("buy_time", "next_open")),
+                   buy_limit_up_open=bool(d.get("buy_limit_up_open", False)))
 
     def to_dict(self) -> dict[str, Any]:
         return {"signal_ids": self.signal_ids,
@@ -133,7 +137,8 @@ class BuyRule:
                 "max_position_pct": self.max_position_pct,
                 "max_total_pct": self.max_total_pct,
                 "max_symbols": self.max_symbols,
-                "buy_time": self.buy_time}
+                "buy_time": self.buy_time,
+                "buy_limit_up_open": self.buy_limit_up_open}
 
 
 @dataclass
@@ -159,6 +164,9 @@ class SellRule:
     take_profit_prev_close_pct: float | None = None
     max_hold_days: int | None = None
     sell_time: str = "close"
+    # 开盘封跌停但盘中打开（高点>跌停价）时按跌停价（排队价）卖出；默认关闭。
+    # 需要当日完整盘口数据，开启时结算时间必须在盘后（15:00 之后）。
+    sell_limit_down_open: bool = False
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> SellRule:
@@ -189,7 +197,8 @@ class SellRule:
                    take_profit_pct=_ratio("take_profit_pct"),
                    take_profit_prev_close_pct=_ratio("take_profit_prev_close_pct"),
                    max_hold_days=hold,
-                   sell_time=stime)
+                   sell_time=stime,
+                   sell_limit_down_open=bool(d.get("sell_limit_down_open", False)))
 
     def to_dict(self) -> dict[str, Any]:
         return {"exit_signal_ids": self.exit_signal_ids,
@@ -198,7 +207,8 @@ class SellRule:
                 "take_profit_pct": self.take_profit_pct,
                 "take_profit_prev_close_pct": self.take_profit_prev_close_pct,
                 "max_hold_days": self.max_hold_days,
-                "sell_time": self.sell_time}
+                "sell_time": self.sell_time,
+                "sell_limit_down_open": self.sell_limit_down_open}
 
 
 # ── 账户 ────────────────────────────────────────────────
@@ -316,6 +326,13 @@ class PaperStrategy:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> PaperStrategy:
+        buy_rule = BuyRule.from_dict(d.get("buy_rule"))
+        sell_rule = SellRule.from_dict(d.get("sell_rule"))
+        simulate_time = str(d.get("simulate_time", "15:30"))
+        if (buy_rule.buy_limit_up_open or sell_rule.sell_limit_down_open) \
+                and simulate_time < "15:00":
+            raise ValueError("涨跌停打开买入/卖出需要当日完整盘口数据，"
+                             "结算时间必须设置在盘后（15:00 之后）")
         return cls(
             id=validate_id(str(d["id"]), "策略id"),
             name=str(d["name"]),
@@ -323,10 +340,10 @@ class PaperStrategy:
             iwencai_query=str(d.get("iwencai_query", "")),
             api_key=str(d.get("api_key", "")),
             enabled=bool(d.get("enabled", True)),
-            buy_rule=BuyRule.from_dict(d.get("buy_rule")),
-            sell_rule=SellRule.from_dict(d.get("sell_rule")),
+            buy_rule=buy_rule,
+            sell_rule=sell_rule,
             fetch_time=str(d.get("fetch_time", "09:25")),
-            simulate_time=str(d.get("simulate_time", "15:30")),
+            simulate_time=simulate_time,
             created_at=(str(d["created_at"]) if d.get("created_at") else None),
         )
 

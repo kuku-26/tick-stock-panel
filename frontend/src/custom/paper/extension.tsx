@@ -30,6 +30,7 @@ function buySummary(br: BuyRule): string {
   }
   parts.push(br.buy_time === 'same_open' ? '当日开盘买' : '次日开盘买')
   if (br.max_symbols > 0) parts.push(`日限${br.max_symbols}只`)
+  if (br.buy_limit_up_open) parts.push('涨停开买')
   return parts.join(' · ')
 }
 
@@ -46,6 +47,7 @@ function sellSummary(sr: SellRule): string {
   if (sr.max_hold_days) parts.push(`持有${sr.max_hold_days}日`)
   if (sr.exit_signal_ids?.length) parts.push(`信号退出×${sr.exit_signal_ids.length}`)
   parts.push(sr.sell_time === 'open' ? '开盘卖' : '收盘卖')
+  if (sr.sell_limit_down_open) parts.push('跌停开卖')
   return parts.join(' · ')
 }
 
@@ -90,8 +92,16 @@ function StrategyForm({
   const [dynFields, setDynFields] = useState<FieldOption[]>([])
   const [testing, setTesting] = useState(false)
   const [testErr, setTestErr] = useState('')
-  const buyRule = draft.buy_rule ?? { signal_ids: [], iwencai_filters: [], sort_field: '', sort_order: 'desc', top_n: 0, max_position_pct: 0.2, max_total_pct: 0, max_symbols: 0, buy_time: 'next_open' }
-  const sellRule = draft.sell_rule ?? { exit_signal_ids: [], stop_loss_pct: null, stop_loss_prev_close_pct: null, take_profit_pct: null, take_profit_prev_close_pct: null, max_hold_days: null, sell_time: 'close' }
+  const buyRule = draft.buy_rule ?? { signal_ids: [], iwencai_filters: [], sort_field: '', sort_order: 'desc', top_n: 0, max_position_pct: 0.2, max_total_pct: 0, max_symbols: 0, buy_time: 'next_open', buy_limit_up_open: false }
+  const sellRule = draft.sell_rule ?? { exit_signal_ids: [], stop_loss_pct: null, stop_loss_prev_close_pct: null, take_profit_pct: null, take_profit_prev_close_pct: null, max_hold_days: null, sell_time: 'close', sell_limit_down_open: false }
+  // 涨跌停打开买卖需当日完整盘口数据：结算时间必须在盘后（15:00 之后）才允许开启，
+  // 未满足时点击勾选会弹窗提示（后端保存与加载同样强制校验）
+  const afterClose = (draft.simulate_time || '15:30') >= '15:00'
+  const [limitOpenWarn, setLimitOpenWarn] = useState(false)
+  const guardLimitOpen = (checked: boolean, apply: (v: boolean) => void) => {
+    if (checked && !afterClose) { setLimitOpenWarn(true); return }
+    apply(checked)
+  }
   // 预览/快照字段在前、内置字段兜底，去重
   const effFields: FieldOption[] = []
   for (const f of [...dynFields, ...fields]) if (!effFields.some(x => x.key === f.key)) effFields.push(f)
@@ -127,6 +137,14 @@ function StrategyForm({
     try { setDynFields(await onTestFields(draft.iwencai_query, draft.api_key)) }
     catch (e) { setTestErr(String(e)) }
     finally { setTesting(false) }
+  }
+  // 保存前置校验: 已开启涨跌停打开买卖但结算时间不在盘后时, 弹窗拦截保存
+  const handleSubmit = (newAccount?: { id: string; name: string; initial_cash: number } | null) => {
+    if ((buyRule.buy_limit_up_open || sellRule.sell_limit_down_open) && !afterClose) {
+      setLimitOpenWarn(true)
+      return
+    }
+    submit(newAccount)
   }
 
   return (
@@ -302,6 +320,12 @@ function StrategyForm({
           </div>
         )}
         <div className="text-[11px] text-muted">信号库条件与问财字段条件「任一来源满足即可」；两者都未配置则买入全部候选。</div>
+        <label className="flex items-center gap-1 text-xs text-secondary">
+          <input type="checkbox" checked={!!buyRule.buy_limit_up_open}
+            onChange={e => guardLimitOpen(e.target.checked,
+              v => setDraft({ ...draft, buy_rule: { ...buyRule, buy_limit_up_open: v } }))} />
+          涨停打开买入（开盘封涨停、盘中打开时按涨停价成交）
+        </label>
       </div>
 
       <div className="col-span-2 rounded-btn border border-border p-3 flex flex-col gap-2">
@@ -356,13 +380,36 @@ function StrategyForm({
           止损/止盈为小数制，如 -0.08 表示亏损 8% 止损、0.3 表示盈利 30% 止盈；止损/止盈-前收相对前一交易日收盘价，
           如 -0.05 表示跌破前收 5% 止损、0.05 表示涨过前收 5% 止盈，多者可同时配置、任一触发即卖。
         </div>
+        <label className="flex items-center gap-1 text-xs text-secondary">
+          <input type="checkbox" checked={!!sellRule.sell_limit_down_open}
+            onChange={e => guardLimitOpen(e.target.checked,
+              v => setDraft({ ...draft, sell_rule: { ...sellRule, sell_limit_down_open: v } }))} />
+          跌停打开卖出（开盘封跌停、盘中打开时按跌停价成交）
+        </label>
       </div>
 
       <button type="button"
-        onClick={() => submit(newAccMode ? { id: newAcc.id, name: newAcc.name, initial_cash: newAcc.initial_cash } : null)}
+        onClick={() => handleSubmit(newAccMode ? { id: newAcc.id, name: newAcc.name, initial_cash: newAcc.initial_cash } : null)}
         className="col-span-2 inline-flex items-center justify-center gap-1 h-9 rounded-btn bg-primary text-primary-foreground text-xs hover:opacity-90">
         <Save size={14} /> 保存策略
       </button>
+
+      {limitOpenWarn && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4" onClick={() => setLimitOpenWarn(false)}>
+          <div className="rounded-btn bg-elevated border border-border p-4 flex flex-col gap-3 w-full max-w-sm" onClick={e => e.stopPropagation()}>
+            <span className="text-sm font-medium">「涨跌停打开买卖」需盘后结算</span>
+            <div className="text-xs text-secondary leading-relaxed">
+              「涨停打开买入 / 跌停打开卖出」依赖当日完整盘口数据（最高价/最低价），仅支持盘后结算。
+              当前策略结算时间为 <b>{draft.simulate_time || '15:30'}</b>（早于 15:00），已阻止开启/保存。
+              请把「结算」时间调整到 <b>15:00 或之后</b> 再试。
+            </div>
+            <div className="flex justify-end pt-1">
+              <button onClick={() => setLimitOpenWarn(false)}
+                className="h-7 px-3 rounded-btn text-xs bg-primary text-primary-foreground">知道了</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -459,7 +506,7 @@ function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade }: {
             <table className="w-full text-left text-xs">
               <thead>
                 <tr className="text-secondary border-b border-border">
-                  <th className="py-1">日期</th><th>代码</th><th>名称</th><th>方向</th><th>数量</th><th>价格</th><th>金额</th><th>原因</th>
+                  <th className="py-1">日期</th><th>代码</th><th>名称</th><th>方向</th><th>数量</th><th>价格</th><th>金额</th><th>盈亏</th><th>原因</th>
                 </tr>
               </thead>
               <tbody>
@@ -471,6 +518,9 @@ function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade }: {
                     <td className={t.side === 'buy' ? 'text-red-300' : 'text-emerald-300'}>{t.side === 'buy' ? '买入' : '卖出'}</td>
                     <td>{t.qty}</td><td>{t.price}</td>
                     <td>{t.amount?.toLocaleString()}</td>
+                    <td>{t.side === 'sell' && t.pnl != null
+                      ? <span className={t.pnl >= 0 ? 'text-red-400' : 'text-emerald-400'}>{t.pnl.toFixed(2)}</span>
+                      : <span className="text-muted">—</span>}</td>
                     <td className="text-muted">{REASON_LABELS[t.reason] ? `${REASON_LABELS[t.reason]}(${t.reason})` : t.reason}</td>
                   </tr>
                 ))}

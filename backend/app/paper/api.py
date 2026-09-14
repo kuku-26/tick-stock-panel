@@ -16,6 +16,7 @@ from .fields import (IWENCAI_FIELD_CATALOG, available_fields,
 from .iwencai_service import run_query
 from .models import (Account, BuyRule, LOT, PaperStrategy, Position,
                      SellRule, TradeRecord, make_id, validate_id)
+from .trading import attach_trade_pnl
 
 router = APIRouter(prefix="/api/paper", tags=["paper"])
 
@@ -271,6 +272,15 @@ def preview_fields(req: PreviewModel, request: Request):
             "fields": available_fields(records)}
 
 
+def _validate_limit_open_settle_time(buy: BuyRule, sell: SellRule, simulate_time: str) -> None:
+    """涨跌停打开买入/卖出依赖当日完整盘口(high/low)，仅允许盘后结算的策略开启。"""
+    if (buy.buy_limit_up_open or sell.sell_limit_down_open) \
+            and str(simulate_time) < "15:00":
+        raise HTTPException(
+            status_code=400,
+            detail="涨跌停打开买入/卖出需结算时间在盘后（15:00 之后）")
+
+
 @router.post("/strategies")
 def create_strategy(req: StrategyModel, request: Request):
     store = _store(request)
@@ -290,6 +300,7 @@ def create_strategy(req: StrategyModel, request: Request):
         sell = SellRule.from_dict(req.sell_rule)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    _validate_limit_open_settle_time(buy, sell, req.simulate_time)
     strategy = PaperStrategy.create(req.id, req.name, req.account_id,
                                     req.iwencai_query.strip(), req.api_key.strip())
     strategy.enabled = req.enabled
@@ -319,6 +330,7 @@ def update_strategy(strategy_id: str, req: StrategyModel, request: Request):
         sell = SellRule.from_dict(req.sell_rule)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    _validate_limit_open_settle_time(buy, sell, req.simulate_time)
     s = strategies[strategy_id]
     s.name = req.name
     s.account_id = req.account_id
@@ -476,16 +488,20 @@ def account_detail(account_id: str, request: Request):
                 "total_value": snap.get("total_value"),
                 "nav": snap.get("nav"),
             })
+        # 成交流水附加每笔卖出盈亏（按股票回放平均成本，见 trading.attach_trade_pnl）
         for t in store.load_trades(bound.id):
+            qty = t.get("qty") or 0
+            price = t.get("price") or 0.0
             trades.append({
                 "date": t.get("date"),
                 "symbol": t.get("symbol"),
                 "side": t.get("side"),
-                "qty": t.get("qty"),
+                "qty": qty,
                 "price": t.get("price"),
                 "reason": t.get("reason"),
-                "amount": round((t.get("qty") or 0) * (t.get("price") or 0), 2),
+                "amount": round(qty * price, 2),
             })
+        attach_trade_pnl(trades)
 
     # 名称/最新价：名称走全局维表；最新价优先取实时行情缓存（QuoteService 的
     # 最新 enriched 合并盘中实时价, 实盘开关关闭/不可用时回退 enriched 最新收盘）

@@ -112,9 +112,16 @@ def _fill_pending(market: MarketData, account: Account, strategy: PaperStrategy,
     for order in account.pending:
         row = rows.get(order.symbol)
         if not market.buyable_at_open(order.symbol, row):
-            remaining.append(order)
-            continue
-        price = row.open
+            # 开盘封涨停/停牌顺延；开启「涨停打开买入」且盘中打开
+            # （低点<涨停价）时按排队价（涨停价）成交。
+            fill = market.limit_up_open_buy_price(order.symbol, row) \
+                if (strategy.buy_rule.buy_limit_up_open and row is not None) else None
+            if fill is None:
+                remaining.append(order)
+                continue
+            price = fill
+        else:
+            price = row.open
         affordable = int(account.cash // (price * LOT)) * LOT
         qty = min(order.qty, affordable)
         if qty < LOT or affordable < LOT:
@@ -177,14 +184,21 @@ def _sell_positions(market: MarketData, account: Account, strategy: PaperStrateg
         if pos.entry_date >= date:
             continue  # 当日新建仓，T+1 不可卖
         row = rows.get(symbol)
-        if not market.sellable_at_open(symbol, row):
-            if row is not None:
-                logger.info("paper sell skip %s: 开盘跌停/停牌，当日不可卖", symbol)
-            continue
         reason = decide_exit(strategy, pos, row, date)
         if reason is None:
             continue
-        price = _exit_fill_price(rule, pos, row, reason)
+        if not market.sellable_at_open(symbol, row):
+            # 开盘封跌停/停牌当日不可卖；开启「跌停打开卖出」且盘中打开
+            # （高点>跌停价）时按排队价（跌停价）成交。
+            fill = market.limit_down_open_sell_price(symbol, row) \
+                if (rule.sell_limit_down_open and row is not None) else None
+            if fill is None:
+                if row is not None:
+                    logger.info("paper sell skip %s: 开盘跌停/停牌，当日不可卖", symbol)
+                continue
+            price = fill
+        else:
+            price = _exit_fill_price(rule, pos, row, reason)
         qty = pos.qty
         proceeds = qty * price
         account.cash += proceeds
@@ -294,8 +308,14 @@ def _generate_buys(account: Account, strategy: PaperStrategy, candidates: list[s
             continue
         if same_open and market is not None \
                 and not market.buyable_at_open(sym, rows[sym]):
-            logger.info("paper buy skip %s: 当日开盘不可买(一字板/涨停/停牌)", sym)
-            continue
+            # 开盘封涨停/一字板/停牌不可买；开启「涨停打开买入」且盘中打开
+            # （低点<涨停价）时按排队价（涨停价）买入。
+            fill = market.limit_up_open_buy_price(sym, rows[sym]) \
+                if rule.buy_limit_up_open else None
+            if fill is None:
+                logger.info("paper buy skip %s: 当日开盘不可买(一字板/涨停/停牌)", sym)
+                continue
+            price = fill
         budget = min(per_budget, account.cash, total_budget)
         qty = int(budget // (price * LOT)) * LOT
         if qty < LOT:
@@ -311,6 +331,29 @@ def _generate_buys(account: Account, strategy: PaperStrategy, candidates: list[s
 def strategy_signal_ids(strategy: PaperStrategy) -> set[str]:
     """策略买入/卖出规则引用的全部信号 id(供 day_rows 按需计算 csg 列)。"""
     return set(strategy.buy_rule.signal_ids) | set(strategy.sell_rule.exit_signal_ids)
+
+
+def attach_trade_pnl(trades: list[dict]) -> None:
+    """为成交流水附加每笔卖出盈亏 pnl（就地写入 trade["pnl"]，买入为 None）。
+
+    按股票回放平均成本（与引擎 Position.avg_cost 口径一致）：买入累计数量与
+    成本合计；卖出按当时平均成本计盈亏（整仓卖出时精确一致，部分卖出为近似）。
+    卖出数量超过回放持仓（数据异常）时 pnl 为 None。
+    """
+    state: dict[str, tuple[int, float]] = {}  # symbol -> (持有股数, 成本合计)
+    for t in trades:
+        qty = t.get("qty") or 0
+        price = t.get("price") or 0.0
+        sym = t.get("symbol")
+        held, cost_sum = state.get(sym, (0, 0.0))
+        pnl = None
+        if t.get("side") == "buy":
+            state[sym] = (held + qty, cost_sum + qty * price)
+        elif held > 0 and held >= qty:
+            avg = cost_sum / held
+            pnl = round((price - avg) * qty, 2)
+            state[sym] = (held - qty, cost_sum - avg * qty)
+        t["pnl"] = pnl
 
 
 def _align_symbol_keys(rows: dict[str, DayRow], candidates: list[str],

@@ -234,6 +234,45 @@ class MarketData:
         return not (limit_dn is not None and row.open is not None and row.open > 0
                     and row.open <= limit_dn + 0.001)  # 开盘即封跌停则不可卖
 
+    def limit_down_open_sell_price(self, symbol: str, row: DayRow | None) -> float | None:
+        """「跌停打开卖出」成交价：开盘封跌停且盘中打开（高点>跌停价）→ 跌停价；否则 None。
+
+        卖单按跌停价排队，盘中打开即按排队价（跌停价）成交，而非打开后的更高价。
+        需要当日完整盘口（high），故仅限盘后结算时启用。
+        """
+        if row is None or row.open is None or row.open <= 0 \
+                or row.close is None or row.close <= 0:
+            return None  # 停牌 / 无成交
+        dn = self._limit_price(symbol, row.prev_close, -1)
+        if dn is None or row.open > dn + 0.001:
+            return None  # 开盘不是跌停价
+        high = row.high if (row.high is not None and row.high > 0) else None
+        if high is None or high <= dn + 0.001:
+            return None  # 全天封死，盘中未打开
+        return dn
+
+    def limit_up_open_buy_price(self, symbol: str, row: DayRow | None) -> float | None:
+        """「涨停打开买入」成交价：开盘封涨停且盘中打开（低点<涨停价）→ 涨停价；否则 None。
+
+        买单按涨停价排队，盘中打开即按排队价（涨停价）成交，而非打开后的更低价。
+        涨停价口径与 buyable_at_open 一致（维表优先，偏差过大弃用后按板块推算）。
+        """
+        if row is None or row.open is None or row.open <= 0 \
+                or row.volume is None or row.volume <= 0:
+            return None  # 停牌 / 无成交
+        limit = self.symbol_limit_up(symbol)
+        heuristic = self._heuristic_limit_up(symbol, row.prev_close)
+        if limit is not None and heuristic is not None \
+                and abs(limit - heuristic) > heuristic * 0.02:
+            limit = None  # 维表涨停价与推算偏差过大, 弃用
+        limit = limit or heuristic
+        if limit is None or row.open < limit - 0.001:
+            return None  # 开盘不是涨停价
+        low = row.low if (row.low is not None and row.low > 0) else None
+        if low is None or low >= limit - 0.001:
+            return None  # 全天封死，盘中未打开
+        return limit
+
     def latest_date(self) -> str | None:
         """enriched 最新分区日期(通常为最近一个已落盘交易日); 无数据返回 None。"""
         ds = sorted(p.name.removeprefix("date=")

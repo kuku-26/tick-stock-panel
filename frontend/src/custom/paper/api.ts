@@ -44,6 +44,7 @@ export interface BuyRule {
   max_total_pct: number
   max_symbols: number
   buy_time: string
+  buy_limit_up_open: boolean
 }
 
 export interface SellRule {
@@ -54,6 +55,7 @@ export interface SellRule {
   take_profit_prev_close_pct: number | null
   max_hold_days: number | null
   sell_time: string
+  sell_limit_down_open: boolean
 }
 
 export interface PaperStrategy {
@@ -98,6 +100,7 @@ export interface Trade {
   amount: number
   reason: string
   name?: string | null
+  pnl?: number | null
 }
 
 export interface DaySummary {

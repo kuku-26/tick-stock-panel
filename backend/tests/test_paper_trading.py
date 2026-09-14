@@ -14,7 +14,7 @@ from app.paper.models import (Account, BuyRule, PaperStrategy, SellRule,
 from app.paper.scheduler import PaperScheduler, _simulate
 from app.paper.service import MarketDataNotReadyError, run_simulate
 from app.paper.store import PaperStore
-from app.paper.trading import (_exit_fill_price, decide_exit,
+from app.paper.trading import (_exit_fill_price, attach_trade_pnl, decide_exit,
                                entry_signal_passes, process_day)
 
 
@@ -48,6 +48,30 @@ class FakeMarket:
         lim = self.limit_down.get(symbol)
         return not (lim and row.open is not None and row.open > 0
                     and row.open <= lim + 0.001)
+
+    def limit_down_open_sell_price(self, symbol: str, row: DayRow | None):
+        if row is None or row.open is None or row.open <= 0 \
+                or row.close is None or row.close <= 0:
+            return None
+        dn = self.limit_down.get(symbol)
+        if dn is None or row.open > dn + 0.001:
+            return None
+        high = row.high if (row.high is not None and row.high > 0) else None
+        if high is None or high <= dn + 0.001:
+            return None
+        return dn
+
+    def limit_up_open_buy_price(self, symbol: str, row: DayRow | None):
+        if row is None or row.open is None or row.open <= 0 \
+                or row.volume is None or row.volume <= 0:
+            return None
+        lim = self.symbol_limit_up(symbol)
+        if lim is None or row.open < lim - 0.001:
+            return None
+        low = row.low if (row.low is not None and row.low > 0) else None
+        if low is None or low >= lim - 0.001:
+            return None
+        return lim
 
 
 def r(symbol, open_, close, volume=100000, csg=None, high=None, low=None, prev_close=None):
@@ -802,3 +826,127 @@ def test_exit_signal_sell_time_open():
 def test_sell_rule_rejects_bad_sell_time():
     with pytest.raises(ValueError):
         SellRule.from_dict({"sell_time": "noon"})
+
+
+# ── 涨跌停打开买卖 ────────────────────────────────────────
+
+
+def test_limit_down_open_sell():
+    """开启「跌停打开卖出」: 开盘封跌停、盘中打开(高点>跌停价) → 按跌停价卖出。"""
+    # prev_close 10 → 跌停 9.0; open 9.0 封死, high 9.3 盘中打开
+    mk = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 10, 10)},
+        # 次日(hold_days=1 触发 max_hold): 开盘跌停但盘中打开
+        "2026-01-03": {"000001": r("000001", 9.0, 9.1, high=9.3, low=8.9,
+                                   prev_close=10.0)},
+    }, limit_down={"000001": 9.0})
+    acct = make_account()
+    s = make_strategy()
+    s.buy_rule.buy_time = "same_open"
+    s.sell_rule = SellRule(max_hold_days=1, sell_time="open",
+                           sell_limit_down_open=True)
+    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
+    trades, _ = process_day(mk, acct, s, "2026-01-03", candidates=[])
+    sells = [t for t in trades if t.side == "sell"]
+    assert len(sells) == 1 and sells[0].reason == "max_hold"
+    assert sells[0].price == pytest.approx(9.0), "应按排队价(跌停价)成交, 而非打开后的高价"
+    assert not acct.positions
+
+
+def test_limit_down_never_opened_no_sell():
+    """未开启或全天封死时不卖: 默认行为保持(开盘跌停当日不卖)。"""
+    # 全天封死: high == open == 跌停 9.0
+    mk = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 10, 10)},
+        "2026-01-03": {"000001": r("000001", 9.0, 9.0, high=9.0, low=9.0,
+                                   prev_close=10.0)},
+    }, limit_down={"000001": 9.0})
+    acct = make_account()
+    s = make_strategy()
+    s.buy_rule.buy_time = "same_open"
+    s.sell_rule = SellRule(max_hold_days=1, sell_time="open",
+                           sell_limit_down_open=True)
+    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
+    trades, _ = process_day(mk, acct, s, "2026-01-03", candidates=[])
+    assert [t for t in trades if t.side == "sell"] == [], "全天封死无法成交, 应继续持有"
+    assert "000001" in acct.positions
+
+    # 选项关闭时即使盘中打开也不卖
+    mk2 = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 10, 10)},
+        "2026-01-03": {"000001": r("000001", 9.0, 9.1, high=9.3, low=8.9,
+                                   prev_close=10.0)},
+    }, limit_down={"000001": 9.0})
+    acct2 = make_account()
+    s2 = make_strategy()
+    s2.buy_rule.buy_time = "same_open"
+    s2.sell_rule = SellRule(max_hold_days=1, sell_time="open")
+    process_day(mk2, acct2, s2, "2026-01-02", candidates=["000001"])
+    trades2, _ = process_day(mk2, acct2, s2, "2026-01-03", candidates=[])
+    assert [t for t in trades2 if t.side == "sell"] == [], "未开启选项不应卖出"
+
+
+def test_limit_up_open_buy():
+    """开启「涨停打开买入」: 开盘封涨停、盘中打开(低点<涨停价) → 按涨停价买入。"""
+    # prev_close 10 → 涨停 11.0; open 11.0 封死, low 10.8 盘中打开
+    mk = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 11.0, 11.2, high=11.3, low=10.8,
+                                   prev_close=10.0)},
+    }, limit_up={"000001": 11.0})
+    acct = make_account(cash=10000)
+    s = make_strategy()
+    s.buy_rule.buy_time = "same_open"
+    s.buy_rule.max_position_pct = 0.5
+    s.buy_rule.buy_limit_up_open = True
+    trades, _ = process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
+    buys = [t for t in trades if t.side == "buy"]
+    assert len(buys) == 1
+    assert buys[0].price == pytest.approx(11.0), "应按排队价(涨停价)成交"
+
+    # 选项关闭时不买(默认行为)
+    mk2 = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 11.0, 11.2, high=11.3, low=10.8,
+                                   prev_close=10.0)},
+    }, limit_up={"000001": 11.0})
+    acct2 = make_account(cash=10000)
+    s2 = make_strategy()
+    s2.buy_rule.buy_time = "same_open"
+    s2.buy_rule.max_position_pct = 0.5
+    trades2, _ = process_day(mk2, acct2, s2, "2026-01-02", candidates=["000001"])
+    assert [t for t in trades2 if t.side == "buy"] == [], "未开启选项不应买入"
+
+
+def test_limit_open_options_require_after_close_settlement():
+    """涨跌停打开买卖需当日完整盘口: 结算时间早于 15:00 的策略加载即报错。"""
+    base = {"id": "strat1", "name": "策略", "account_id": "acc1",
+            "iwencai_query": "query", "simulate_time": "14:30"}
+    bad = dict(base, sell_rule={"sell_limit_down_open": True})
+    with pytest.raises(ValueError, match="盘后"):
+        PaperStrategy.from_dict(bad)
+    bad2 = dict(base, buy_rule={"buy_limit_up_open": True})
+    with pytest.raises(ValueError, match="盘后"):
+        PaperStrategy.from_dict(bad2)
+    # 15:00 及之后允许
+    ok = dict(base, simulate_time="15:00",
+              sell_rule={"sell_limit_down_open": True},
+              buy_rule={"buy_limit_up_open": True})
+    strat = PaperStrategy.from_dict(ok)
+    assert strat.sell_rule.sell_limit_down_open and strat.buy_rule.buy_limit_up_open
+
+
+def test_attach_trade_pnl_replays_average_cost():
+    """流水盈亏回放: 买入累计成本, 卖出按当时平均成本计盈亏; 买入 pnl 为 None。"""
+    trades = [
+        {"symbol": "000001", "side": "buy", "qty": 100, "price": 10.0},
+        {"symbol": "000001", "side": "buy", "qty": 100, "price": 11.0},
+        {"symbol": "000001", "side": "sell", "qty": 200, "price": 11.5},
+        {"symbol": "000002", "side": "buy", "qty": 300, "price": 20.0},
+        {"symbol": "000002", "side": "sell", "qty": 100, "price": 19.0},
+        {"symbol": "000002", "side": "sell", "qty": 500, "price": 21.0},  # 超出回放持仓
+    ]
+    attach_trade_pnl(trades)
+    assert trades[0]["pnl"] is None and trades[1]["pnl"] is None
+    assert trades[2]["pnl"] == pytest.approx(200.0), "(11.5-10.5)×200"
+    assert trades[3]["pnl"] is None
+    assert trades[4]["pnl"] == pytest.approx(-100.0), "(19-20)×100"
+    assert trades[5]["pnl"] is None, "卖出超出回放持仓时应为 None"
