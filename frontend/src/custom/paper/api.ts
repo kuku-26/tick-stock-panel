@@ -16,6 +16,7 @@ export interface Account {
   cash: number
   positions: Record<string, Position>
   pending: Array<{ symbol: string; qty: number; decision_date: string }>
+  pending_sells?: Array<{ symbol: string; qty: number; reason: string; decision_date: string }>
   enabled: boolean
   last_record_date: string | null
 }
@@ -89,7 +90,7 @@ export interface SignalOption {
 }
 
 export interface Trade {
-  id: string
+  id?: string | null
   account_id: string
   strategy_id: string
   date: string
@@ -178,6 +179,8 @@ export const paperApi = {
     req<{ ok: boolean }>(`/accounts/${id}`, { method: 'PUT', body: JSON.stringify(a) }),
   manualTrade: (accountId: string, t: ManualTrade) =>
     req<{ ok: boolean }>(`/accounts/${accountId}/trade`, { method: 'POST', body: JSON.stringify(t) }),
+  deleteTrade: (accountId: string, tradeId: string) =>
+    req<{ ok: boolean }>(`/accounts/${accountId}/trades/${encodeURIComponent(tradeId)}`, { method: 'DELETE' }),
 
   strategies: () =>
     req<{ strategies: PaperStrategy[] }>('/strategies').then(r => r.strategies),

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import date as _date
 
 from fastapi import APIRouter, HTTPException, Request
@@ -17,6 +18,8 @@ from .iwencai_service import run_query
 from .models import (Account, BuyRule, LOT, PaperStrategy, Position,
                      SellRule, TradeRecord, make_id, validate_id)
 from .trading import attach_trade_pnl
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/paper", tags=["paper"])
 
@@ -200,6 +203,67 @@ def manual_trade(account_id: str, req: ManualTradeModel, request: Request):
                          round(req.qty * req.price, 2), "manual")
         store.append_trades(bound.id, [tr])
     return {"ok": True, "account": acc.to_dict()}
+
+
+@router.delete("/accounts/{account_id}/trades/{trade_id}")
+def delete_trade(account_id: str, trade_id: str, request: Request):
+    """删除一笔交易并回放重建账户状态。
+
+    从绑定策略的流水中移除该笔成交，然后按剩余流水从初始资金重放
+    （买入累计成本、卖出按均价减仓），修正现金与持仓。历史每日快照
+    （净值曲线）不改写，后续结算按新状态落盘。
+    """
+    store = _store(request)
+    accounts = store.load_accounts()
+    if account_id not in accounts:
+        raise HTTPException(status_code=404, detail="账户不存在")
+    strategies = store.load_strategies()
+    bound = next((s for s in strategies.values() if s.account_id == account_id), None)
+    if bound is None:
+        raise HTTPException(status_code=400, detail="该账户未绑定策略，无法定位流水")
+    trades = store.load_trades(bound.id)
+    target = next((t for t in trades if t.get("id") == trade_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="交易记录不存在")
+    if target.get("account_id") != account_id:
+        raise HTTPException(status_code=400, detail="交易不属于该账户")
+    remaining = [t for t in trades if t.get("id") != trade_id]
+
+    acc = accounts[account_id]
+    acc.cash = acc.initial_cash
+    acc.positions = {}
+    for t in remaining:
+        try:
+            qty = int(t.get("qty") or 0)
+            price = float(t.get("price") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        sym = t.get("symbol")
+        if not sym or qty <= 0 or price <= 0:
+            continue
+        if t.get("side") == "buy":
+            cost = qty * price
+            acc.cash -= cost
+            if sym in acc.positions:
+                pos = acc.positions[sym]
+                tq = pos.qty + qty
+                pos.avg_cost = (pos.avg_cost * pos.qty + cost) / tq
+                pos.qty = tq
+            else:
+                acc.positions[sym] = Position(sym, qty, price, str(t.get("date") or ""))
+        else:
+            acc.cash += qty * price
+            if sym in acc.positions:
+                pos = acc.positions[sym]
+                pos.qty -= qty
+                if pos.qty <= 0:
+                    del acc.positions[sym]
+    store.rewrite_trades(bound.id, remaining)
+    store.save_accounts(accounts)
+    logger.info("paper delete trade %s (account %s): replayed %d trades",
+                trade_id, account_id, len(remaining))
+    return {"ok": True, "deleted": trade_id, "trades": len(remaining),
+            "account": acc.to_dict()}
 
 
 # ── 策略 ────────────────────────────────────────────────
@@ -493,6 +557,7 @@ def account_detail(account_id: str, request: Request):
             qty = t.get("qty") or 0
             price = t.get("price") or 0.0
             trades.append({
+                "id": t.get("id"),
                 "date": t.get("date"),
                 "symbol": t.get("symbol"),
                 "side": t.get("side"),

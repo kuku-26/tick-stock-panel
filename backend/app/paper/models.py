@@ -154,7 +154,8 @@ class SellRule:
         同成本价止损/止盈）。与成本价线可同时配置，任一触发即卖。
     max_hold_days: 最长持有交易日数，超期卖出。None=不限制。1 = 买入次日卖出。
     sell_time: 信号/持股天数退出的成交时点。close=结算日收盘价（默认）；
-        open=结算日开盘价（持股天数=1 时即"次日开盘卖出"）。止损/止盈始终按线价成交。
+        open=结算日（触发日）开盘价；next_open=触发次日开盘价（登记待卖单，
+        成交日开盘封跌停/停牌则顺延）。止损/止盈始终按线价成交。
     """
 
     exit_signal_ids: list[str] = field(default_factory=list)
@@ -189,8 +190,8 @@ class SellRule:
         if hold is not None and hold <= 0:
             raise ValueError("max_hold_days 必须为正整数")
         stime = str(d.get("sell_time", "close")).lower()
-        if stime not in ("close", "open"):
-            raise ValueError("sell_time 只能是 close 或 open")
+        if stime not in ("close", "open", "next_open"):
+            raise ValueError("sell_time 只能是 close / open / next_open")
         return cls(exit_signal_ids=list(sigs),
                    stop_loss_pct=_ratio("stop_loss_pct"),
                    stop_loss_prev_close_pct=_ratio("stop_loss_prev_close_pct"),
@@ -251,6 +252,28 @@ class PendingOrder:
 
 
 @dataclass
+class PendingSell:
+    """待卖出单：sell_time=next_open 时规则触发当日登记，次日开盘价成交。
+
+    成交日开盘封跌停/停牌则继续顺延，直到可成交。
+    """
+    symbol: str
+    qty: int                # 卖出股数
+    reason: str             # 触发原因（max_hold / stop_loss / exit_signal 等）
+    decision_date: str      # 规则触发日期
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"symbol": self.symbol, "qty": self.qty, "reason": self.reason,
+                "decision_date": self.decision_date}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> PendingSell:
+        return cls(symbol=str(d["symbol"]), qty=int(d["qty"]),
+                   reason=str(d.get("reason", "max_hold")),
+                   decision_date=str(d["decision_date"]))
+
+
+@dataclass
 class Account:
     id: str
     name: str
@@ -258,6 +281,7 @@ class Account:
     cash: float
     positions: dict[str, Position] = field(default_factory=dict)   # symbol -> Position
     pending: list[PendingOrder] = field(default_factory=list)
+    pending_sells: list[PendingSell] = field(default_factory=list)
     enabled: bool = True
     last_record_date: str | None = None
 
@@ -271,6 +295,7 @@ class Account:
             "initial_cash": round(self.initial_cash, 2), "cash": round(self.cash, 2),
             "positions": {s: p.to_dict() for s, p in self.positions.items()},
             "pending": [o.to_dict() for o in self.pending],
+            "pending_sells": [o.to_dict() for o in self.pending_sells],
             "enabled": self.enabled, "last_record_date": self.last_record_date,
         }
 
@@ -282,6 +307,7 @@ class Account:
             cash=float(d["cash"]),
             positions={s: Position.from_dict(p) for s, p in (d.get("positions") or {}).items()},
             pending=[PendingOrder.from_dict(o) for o in (d.get("pending") or [])],
+            pending_sells=[PendingSell.from_dict(o) for o in (d.get("pending_sells") or [])],
             enabled=bool(d.get("enabled", True)),
             last_record_date=d.get("last_record_date"),
         )

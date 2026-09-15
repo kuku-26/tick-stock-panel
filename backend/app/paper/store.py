@@ -178,6 +178,16 @@ class PaperStore:
                     logger.warning("trade line parse failed: %s", e)
         return out
 
+    def rewrite_trades(self, strategy_id: str, trades: list[dict[str, Any]]) -> None:
+        """整文件原子重写流水（删除交易后回放重建用）。"""
+        p = self._trades / f"{strategy_id}.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".jsonl.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            for t in trades:
+                f.write(json.dumps(t, ensure_ascii=False) + "\n")
+        tmp.replace(p)
+
     # ── 级联删除策略相关联的数据 ────────────────────────
     def delete_strategy_data(self, strategy_id: str) -> None:
         """删除一个策略的全部落盘数据：问财快照、每日账户快照、逐笔成交。"""

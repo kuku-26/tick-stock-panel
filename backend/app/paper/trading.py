@@ -24,6 +24,7 @@ from .models import (
     DaySnapshot,
     PaperStrategy,
     PendingOrder,
+    PendingSell,
     Position,
     TradeRecord,
     make_id,
@@ -175,17 +176,25 @@ def _sell_positions(market: MarketData, account: Account, strategy: PaperStrateg
     """对 D 之前建仓的持仓按卖出规则离场（T+1）。
 
     可卖判定：有行情有成交，且开盘未封跌停（开盘跌停无法卖出，继续持有）。
-    成交价见 _exit_fill_price。
+    成交价见 _exit_fill_price。sell_time=next_open 时不当日卖出，登记待卖单
+    由次日（及以后首个可卖日）开盘价成交。
     """
     trades: list[TradeRecord] = []
     rule = strategy.sell_rule
+    queued = {ps.symbol for ps in account.pending_sells}
     for symbol in list(account.positions.keys()):
         pos = account.positions[symbol]
         if pos.entry_date >= date:
             continue  # 当日新建仓，T+1 不可卖
+        if symbol in queued:
+            continue  # 已登记待卖单，等待次日开盘成交
         row = rows.get(symbol)
         reason = decide_exit(strategy, pos, row, date)
         if reason is None:
+            continue
+        if rule.sell_time == "next_open":
+            # 触发次日开盘卖出：当日只登记，不成交
+            account.pending_sells.append(PendingSell(symbol, pos.qty, reason, date))
             continue
         if not market.sellable_at_open(symbol, row):
             # 开盘封跌停/停牌当日不可卖；开启「跌停打开卖出」且盘中打开
@@ -205,6 +214,38 @@ def _sell_positions(market: MarketData, account: Account, strategy: PaperStrateg
         del account.positions[symbol]
         trades.append(TradeRecord(make_id("t"), account.id, strategy.id, date,
                                   symbol, "sell", qty, price, proceeds, reason))
+    return trades
+
+
+def _fill_pending_sells(market: MarketData, account: Account,
+                        strategy: PaperStrategy, rows: dict[str, DayRow],
+                        date: str) -> list[TradeRecord]:
+    """成交 sell_time=next_open 的待卖单：当日开盘价卖出。
+
+    开盘封跌停/停牌（不可卖）则继续顺延到下一交易日再试。
+    """
+    trades: list[TradeRecord] = []
+    remaining: list[PendingSell] = []
+    for ps in account.pending_sells:
+        pos = account.positions.get(ps.symbol)
+        if pos is None or pos.qty <= 0:
+            continue  # 持仓已不存在（如手动清仓），弃单
+        row = rows.get(ps.symbol)
+        if not market.sellable_at_open(ps.symbol, row):
+            if row is not None:
+                logger.info("paper pending sell defer %s: 开盘跌停/停牌，顺延", ps.symbol)
+            remaining.append(ps)
+            continue
+        price = row.open if (row.open is not None and row.open > 0) else row.close
+        qty = min(ps.qty, pos.qty)
+        proceeds = qty * price
+        account.cash += proceeds
+        pos.qty -= qty
+        if pos.qty <= 0:
+            del account.positions[ps.symbol]
+        trades.append(TradeRecord(make_id("t"), account.id, strategy.id, date,
+                                  ps.symbol, "sell", qty, price, proceeds, ps.reason))
+    account.pending_sells = remaining
     return trades
 
 
@@ -392,8 +433,9 @@ def process_day(market: MarketData, account: Account, strategy: PaperStrategy,
     candidates, iwencai_rows = _align_symbol_keys(rows, candidates, iwencai_rows)
 
     trades: list[TradeRecord] = []
-    trades += _fill_pending(market, account, strategy, rows, date)     # 1. 次日开盘
-    trades += _sell_positions(market, account, strategy, rows, date)   # 2. 当日收盘卖出
+    trades += _fill_pending(market, account, strategy, rows, date)     # 1. 次日开盘(买)
+    trades += _fill_pending_sells(market, account, strategy, rows, date)  # 1.5 次日开盘(卖)
+    trades += _sell_positions(market, account, strategy, rows, date)   # 2. 当日卖出
     existing = set(account.positions) | {p.symbol for p in account.pending}
     trades += _generate_buys(account, strategy, candidates or [], rows, date,
                              existing, iwencai_rows, market)            # 3. 买入（当日开盘 或 生成PB）

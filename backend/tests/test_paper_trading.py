@@ -950,3 +950,53 @@ def test_attach_trade_pnl_replays_average_cost():
     assert trades[3]["pnl"] is None
     assert trades[4]["pnl"] == pytest.approx(-100.0), "(19-20)×100"
     assert trades[5]["pnl"] is None, "卖出超出回放持仓时应为 None"
+
+
+# ── sell_time=next_open（次日开盘价卖出） ────────────────
+
+
+def test_sell_time_next_open_queues_and_fills_next_open():
+    """触发日只登记待卖单，次日以开盘价成交。"""
+    mk = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 10, 10)},
+        "2026-01-03": {"000001": r("000001", 10.2, 11)},    # hold_days=1 触发 max_hold=1
+        "2026-01-04": {"000001": r("000001", 10.5, 11.2)},  # 次日开盘成交
+    })
+    acct = make_account()
+    s = make_strategy()
+    s.buy_rule.buy_time = "same_open"
+    s.sell_rule = SellRule(max_hold_days=1, sell_time="next_open")
+    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
+    trades, _ = process_day(mk, acct, s, "2026-01-03", candidates=[])
+    assert [t for t in trades if t.side == "sell"] == [], "触发日不卖出"
+    assert len(acct.pending_sells) == 1
+    assert acct.pending_sells[0].reason == "max_hold"
+    assert "000001" in acct.positions
+    trades2, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
+    sells = [t for t in trades2 if t.side == "sell"]
+    assert len(sells) == 1 and sells[0].reason == "max_hold"
+    assert sells[0].price == pytest.approx(10.5), "次日开盘价成交"
+    assert not acct.positions and not acct.pending_sells
+
+
+def test_pending_sell_defers_when_open_limit_down():
+    """待卖单成交日开盘封跌停 → 顺延到下一可卖日。"""
+    mk = FakeMarket({
+        "2026-01-02": {"000001": r("000001", 10, 10)},
+        "2026-01-03": {"000001": r("000001", 10.2, 11)},   # 触发, 登记待卖单
+        "2026-01-04": {"000001": r("000001", 9.0, 9.0, prev_close=10.0)},  # 开盘跌停
+        "2026-01-05": {"000001": r("000001", 9.5, 9.8)},   # 顺延成交
+    }, limit_down={"000001": 9.0})
+    acct = make_account()
+    s = make_strategy()
+    s.buy_rule.buy_time = "same_open"
+    s.sell_rule = SellRule(max_hold_days=1, sell_time="next_open")
+    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
+    process_day(mk, acct, s, "2026-01-03", candidates=[])
+    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
+    assert [t for t in trades if t.side == "sell"] == [], "跌停日顺延不成交"
+    assert "000001" in acct.positions and len(acct.pending_sells) == 1
+    trades2, _ = process_day(mk, acct, s, "2026-01-05", candidates=[])
+    sells = [t for t in trades2 if t.side == "sell"]
+    assert len(sells) == 1 and sells[0].price == pytest.approx(9.5)
+    assert not acct.positions and not acct.pending_sells

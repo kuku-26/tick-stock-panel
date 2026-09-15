@@ -46,7 +46,7 @@ function sellSummary(sr: SellRule): string {
   if (tpp) parts.push(`前收止盈${tpp}`)
   if (sr.max_hold_days) parts.push(`持有${sr.max_hold_days}日`)
   if (sr.exit_signal_ids?.length) parts.push(`信号退出×${sr.exit_signal_ids.length}`)
-  parts.push(sr.sell_time === 'open' ? '开盘卖' : '收盘卖')
+  parts.push(sr.sell_time === 'next_open' ? '次日开盘卖' : sr.sell_time === 'open' ? '开盘卖' : '收盘卖')
   if (sr.sell_limit_down_open) parts.push('跌停开卖')
   return parts.join(' · ')
 }
@@ -329,8 +329,18 @@ function StrategyForm({
       </div>
 
       <div className="col-span-2 rounded-btn border border-border p-3 flex flex-col gap-2">
-        <div className="text-xs text-secondary font-medium">卖出规则（任一命中即卖出，收盘价成交）</div>
+        <div className="text-xs text-secondary font-medium">
+          卖出规则（任一命中即卖出；{sellRule.sell_time === 'next_open' ? '次日开盘价成交' : sellRule.sell_time === 'open' ? '当日开盘价成交' : '当日收盘价成交'}）
+        </div>
         <div className="flex items-center gap-2 text-xs">
+          <Field label="卖出时点（信号/持有到期）">
+            <select className={inputCls} value={sellRule.sell_time || 'close'}
+              onChange={e => setDraft({ ...draft, sell_rule: { ...sellRule, sell_time: e.target.value } })}>
+              <option value="close">当日收盘价（默认）</option>
+              <option value="open">当日开盘价</option>
+              <option value="next_open">次日开盘价</option>
+            </select>
+          </Field>
           <Field label="离场信号（csg_，OR）">
             <select className={inputCls} value={sig} onChange={e => addSig('sell', e.target.value)}>
               <option value="">— 选择信号 —</option>
@@ -414,11 +424,12 @@ function StrategyForm({
   )
 }
 
-function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade }: {
+function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade, onDeleteTrade }: {
   detail: AccountDetail
   settleTime?: string
   onEdit: () => void
   onManualTrade: () => void
+  onDeleteTrade: (tradeId: string) => void
 }) {
   // 交易流水默认只看最近 5 笔，展开全部时滚动（上限 max-h-64），面板高度不随流水增长
   const [allTrades, setAllTrades] = useState(false)
@@ -506,7 +517,7 @@ function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade }: {
             <table className="w-full text-left text-xs">
               <thead>
                 <tr className="text-secondary border-b border-border">
-                  <th className="py-1">日期</th><th>代码</th><th>名称</th><th>方向</th><th>数量</th><th>价格</th><th>金额</th><th>盈亏</th><th>原因</th>
+                  <th className="py-1">日期</th><th>代码</th><th>名称</th><th>方向</th><th>数量</th><th>价格</th><th>金额</th><th>盈亏</th><th>原因</th><th></th>
                 </tr>
               </thead>
               <tbody>
@@ -522,6 +533,11 @@ function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade }: {
                       ? <span className={t.pnl >= 0 ? 'text-red-400' : 'text-emerald-400'}>{t.pnl.toFixed(2)}</span>
                       : <span className="text-muted">—</span>}</td>
                     <td className="text-muted">{REASON_LABELS[t.reason] ? `${REASON_LABELS[t.reason]}(${t.reason})` : t.reason}</td>
+                    <td className="pr-1 text-right">
+                      {t.id && <button title="删除该笔交易（按剩余流水回放重建资金/持仓）"
+                        onClick={() => onDeleteTrade(t.id!)}
+                        className="inline-flex text-muted hover:text-red-400"><Trash2 size={12} /></button>}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -748,6 +764,15 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onDelete, onEditAccount, on
     await onFetch()
     setShowSheet(true) // 拉取落盘完成后展示当日明细
   }
+  // 删除一笔交易: 后端按剩余流水回放重建资金/持仓, 前端刷新详情
+  const handleDeleteTrade = async (tradeId: string) => {
+    if (!detail) return
+    if (!window.confirm('确认删除该笔交易？\n资金与持仓将按剩余流水回放重建（历史净值曲线不回溯修正）。')) return
+    try {
+      await paperApi.deleteTrade(detail.account.id, tradeId)
+      setDetail(await paperApi.accountDetail(detail.account.id))
+    } catch (e) { window.alert(String(e)) }
+  }
 
   return (
     <div className="rounded-btn border border-border p-4 flex flex-col gap-2">
@@ -805,7 +830,8 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onDelete, onEditAccount, on
       {showDetail && detail && (
         <AccountDetailPanel detail={detail} settleTime={s.simulate_time}
           onEdit={() => onEditAccount(detail.account.id)}
-          onManualTrade={() => onManualTrade(detail.account)} />
+          onManualTrade={() => onManualTrade(detail.account)}
+          onDeleteTrade={handleDeleteTrade} />
       )}
       {showSheet && (
         <SnapshotSheetModal strategyId={s.id} name={s.name} onClose={() => setShowSheet(false)} />
@@ -1081,13 +1107,15 @@ function PaperPage() {
       </div>
 
       {editing && (
-        <div className="rounded-btn border border-border p-4 flex flex-col gap-3">
-          <div className="flex items-center justify-between">
-            <span className="text-sm font-medium flex items-center gap-1"><Settings2 size={14} /> {isNew ? '新建策略' : '编辑策略'}</span>
-            <button onClick={closeEditor} className="text-xs text-secondary hover:text-foreground">× 关闭</button>
+        <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/50 p-4 overflow-auto" onClick={closeEditor}>
+          <div className="rounded-btn bg-elevated border border-border p-4 flex flex-col gap-3 w-full max-w-3xl my-6" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-medium flex items-center gap-1"><Settings2 size={14} /> {isNew ? '新建策略' : `编辑策略 · ${editing.name || editing.id}`}</span>
+              <button onClick={closeEditor} className="text-xs text-secondary hover:text-foreground">× 关闭</button>
+            </div>
+            <StrategyForm signals={signals} fields={formFields ?? fields} accounts={accounts} draft={editing}
+              isNew={isNew} queryLocked={queryLocked} setDraft={setEditing} submit={saveStrategy} onTestFields={testFields} />
           </div>
-          <StrategyForm signals={signals} fields={formFields ?? fields} accounts={accounts} draft={editing}
-            isNew={isNew} queryLocked={queryLocked} setDraft={setEditing} submit={saveStrategy} onTestFields={testFields} />
         </div>
       )}
 
