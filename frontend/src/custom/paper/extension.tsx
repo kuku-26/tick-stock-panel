@@ -58,9 +58,9 @@ function runDays(created?: string | null): number | null {
   return Math.max(0, Math.floor((Date.now() - t.getTime()) / 86_400_000))
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({ label, children, className }: { label: string; children: React.ReactNode; className?: string }) {
   return (
-    <label className="flex flex-col gap-1 text-xs text-secondary">
+    <label className={`flex flex-col gap-1 text-xs text-secondary ${className ?? ''}`}>
       <span>{label}</span>
       {children}
     </label>
@@ -332,8 +332,8 @@ function StrategyForm({
         <div className="text-xs text-secondary font-medium">
           卖出规则（任一命中即卖出；{sellRule.sell_time === 'next_open' ? '次日开盘价成交' : sellRule.sell_time === 'open' ? '当日开盘价成交' : '当日收盘价成交'}）
         </div>
-        <div className="flex items-center gap-2 text-xs">
-          <Field label="卖出时点（信号/持有到期）">
+        <div className="flex items-center gap-2 flex-wrap text-xs">
+          <Field label="卖出时点（信号/持有到期）" className="min-w-[170px] flex-1">
             <select className={inputCls} value={sellRule.sell_time || 'close'}
               onChange={e => setDraft({ ...draft, sell_rule: { ...sellRule, sell_time: e.target.value } })}>
               <option value="close">当日收盘价（默认）</option>
@@ -341,33 +341,33 @@ function StrategyForm({
               <option value="next_open">次日开盘价</option>
             </select>
           </Field>
-          <Field label="离场信号（csg_，OR）">
+          <Field label="离场信号（csg_，OR）" className="min-w-[170px] flex-1">
             <select className={inputCls} value={sig} onChange={e => addSig('sell', e.target.value)}>
               <option value="">— 选择信号 —</option>
               {signals.map(s => <option key={s.id} value={s.id}>{s.name} ({s.kind})</option>)}
             </select>
           </Field>
-          <Field label="止损(%)">
+          <Field label="止损(%)" className="min-w-[130px] flex-1">
             <input className={inputCls} type="number" step="0.01"
               value={sellRule.stop_loss_pct ?? ''}
               onChange={e => setDraft({ ...draft, sell_rule: { ...sellRule, stop_loss_pct: e.target.value === '' ? null : Number(e.target.value) } })} />
           </Field>
-          <Field label="止损-前收(%)">
+          <Field label="止损-前收(%)" className="min-w-[130px] flex-1">
             <input className={inputCls} type="number" step="0.01"
               value={sellRule.stop_loss_prev_close_pct ?? ''}
               onChange={e => setDraft({ ...draft, sell_rule: { ...sellRule, stop_loss_prev_close_pct: e.target.value === '' ? null : Number(e.target.value) } })} />
           </Field>
-          <Field label="止盈(%)">
+          <Field label="止盈(%)" className="min-w-[130px] flex-1">
             <input className={inputCls} type="number" step="0.01"
               value={sellRule.take_profit_pct ?? ''}
               onChange={e => setDraft({ ...draft, sell_rule: { ...sellRule, take_profit_pct: e.target.value === '' ? null : Number(e.target.value) } })} />
           </Field>
-          <Field label="止盈-前收(%)">
+          <Field label="止盈-前收(%)" className="min-w-[130px] flex-1">
             <input className={inputCls} type="number" step="0.01"
               value={sellRule.take_profit_prev_close_pct ?? ''}
               onChange={e => setDraft({ ...draft, sell_rule: { ...sellRule, take_profit_prev_close_pct: e.target.value === '' ? null : Number(e.target.value) } })} />
           </Field>
-          <Field label="最长持有(日,空=不限)">
+          <Field label="最长持有(日,空=不限)" className="min-w-[140px] flex-1">
             <input className={inputCls} type="number" min="1"
               value={sellRule.max_hold_days ?? ''}
               onChange={e => setDraft({ ...draft, sell_rule: { ...sellRule, max_hold_days: e.target.value === '' ? null : Number(e.target.value) } })} />
