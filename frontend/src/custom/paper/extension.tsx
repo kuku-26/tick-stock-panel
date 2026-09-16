@@ -479,7 +479,7 @@ function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade, onDelet
           <table className="w-full text-left text-xs">
             <thead>
               <tr className="text-secondary border-b border-border">
-                <th className="py-1">代码</th><th>名称</th><th>数量</th><th>成本价</th><th>现价</th><th>收益率</th>
+                <th className="py-1">代码</th><th>名称</th><th>数量</th><th>成本价</th><th>现价</th><th>盈亏金额</th><th>收益率</th>
               </tr>
             </thead>
             <tbody>
@@ -490,6 +490,9 @@ function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade, onDelet
                   <td>{p.qty}</td>
                   <td>{p.avg_cost}</td>
                   <td>{p.last_price ?? '-'}</td>
+                  <td>{p.pnl != null
+                    ? <span className={p.pnl >= 0 ? 'text-red-300' : 'text-emerald-300'}>{p.pnl.toFixed(2)}</span>
+                    : <span className="text-muted">-</span>}</td>
                   <td className={(p.pnl_pct ?? 0) > 0 ? 'text-red-300' : (p.pnl_pct ?? 0) < 0 ? 'text-emerald-300' : ''}>
                     {p.pnl_pct != null ? `${p.pnl_pct > 0 ? '+' : ''}${p.pnl_pct}%` : '-'}
                   </td>
@@ -517,7 +520,7 @@ function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade, onDelet
             <table className="w-full text-left text-xs">
               <thead>
                 <tr className="text-secondary border-b border-border">
-                  <th className="py-1">日期</th><th>代码</th><th>名称</th><th>方向</th><th>数量</th><th>价格</th><th>金额</th><th>盈亏</th><th>原因</th><th></th>
+                  <th className="py-1">日期</th><th>代码</th><th>名称</th><th>方向</th><th>数量</th><th>价格</th><th>金额</th><th>盈亏</th><th>收益率</th><th>原因</th><th></th>
                 </tr>
               </thead>
               <tbody>
@@ -531,6 +534,9 @@ function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade, onDelet
                     <td>{t.amount?.toLocaleString()}</td>
                     <td>{t.side === 'sell' && t.pnl != null
                       ? <span className={t.pnl >= 0 ? 'text-red-400' : 'text-emerald-400'}>{t.pnl.toFixed(2)}</span>
+                      : <span className="text-muted">—</span>}</td>
+                    <td>{t.side === 'sell' && t.pnl_pct != null
+                      ? <span className={t.pnl_pct >= 0 ? 'text-red-400' : 'text-emerald-400'}>{t.pnl_pct > 0 ? '+' : ''}{t.pnl_pct}%</span>
                       : <span className="text-muted">—</span>}</td>
                     <td className="text-muted">{REASON_LABELS[t.reason] ? `${REASON_LABELS[t.reason]}(${t.reason})` : t.reason}</td>
                     <td className="pr-1 text-right">

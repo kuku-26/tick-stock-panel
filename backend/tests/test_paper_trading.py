@@ -948,9 +948,12 @@ def test_attach_trade_pnl_replays_average_cost():
     attach_trade_pnl(trades)
     assert trades[0]["pnl"] is None and trades[1]["pnl"] is None
     assert trades[2]["pnl"] == pytest.approx(200.0), "(11.5-10.5)×200"
+    assert trades[2]["pnl_pct"] == pytest.approx(9.52), "(11.5-10.5)/10.5"
     assert trades[3]["pnl"] is None
     assert trades[4]["pnl"] == pytest.approx(-100.0), "(19-20)×100"
+    assert trades[4]["pnl_pct"] == pytest.approx(-5.0), "(19-20)/20"
     assert trades[5]["pnl"] is None, "卖出超出回放持仓时应为 None"
+    assert trades[5]["pnl_pct"] is None
 
 
 def test_replay_account_recomputes_hold_days():

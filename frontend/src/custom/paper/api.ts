@@ -90,7 +90,7 @@ export interface SignalOption {
 }
 
 export interface Trade {
-  id?: string | null
+  id: string
   account_id: string
   strategy_id: string
   date: string
@@ -102,6 +102,7 @@ export interface Trade {
   reason: string
   name?: string | null
   pnl?: number | null
+  pnl_pct?: number | null
 }
 
 export interface DaySummary {
@@ -127,6 +128,7 @@ export interface AccountPosition {
   name?: string | null
   last_price?: number | null
   pnl_pct?: number | null
+  pnl?: number | null
 }
 
 export interface AccountDetail {

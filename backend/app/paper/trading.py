@@ -375,11 +375,12 @@ def strategy_signal_ids(strategy: PaperStrategy) -> set[str]:
 
 
 def attach_trade_pnl(trades: list[dict]) -> None:
-    """为成交流水附加每笔卖出盈亏 pnl（就地写入 trade["pnl"]，买入为 None）。
+    """为成交流水附加每笔卖出盈亏 pnl / 盈亏率 pnl_pct（就地写入，买入为 None）。
 
     按股票回放平均成本（与引擎 Position.avg_cost 口径一致）：买入累计数量与
     成本合计；卖出按当时平均成本计盈亏（整仓卖出时精确一致，部分卖出为近似）。
-    卖出数量超过回放持仓（数据异常）时 pnl 为 None。
+    盈亏率 = (卖价 − 当时均价) / 当时均价，相对卖出股数×平均成本的成本基数。
+    卖出数量超过回放持仓（数据异常）时均为 None。
     """
     state: dict[str, tuple[int, float]] = {}  # symbol -> (持有股数, 成本合计)
     for t in trades:
@@ -387,14 +388,16 @@ def attach_trade_pnl(trades: list[dict]) -> None:
         price = t.get("price") or 0.0
         sym = t.get("symbol")
         held, cost_sum = state.get(sym, (0, 0.0))
-        pnl = None
+        pnl = pnl_pct = None
         if t.get("side") == "buy":
             state[sym] = (held + qty, cost_sum + qty * price)
         elif held > 0 and held >= qty:
             avg = cost_sum / held
             pnl = round((price - avg) * qty, 2)
+            pnl_pct = round((price - avg) / avg * 100, 2) if avg else None
             state[sym] = (held - qty, cost_sum - avg * qty)
         t["pnl"] = pnl
+        t["pnl_pct"] = pnl_pct
 
 
 def replay_account(acc: Account, trades: list[dict],

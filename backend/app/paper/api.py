@@ -579,10 +579,12 @@ def account_detail(account_id: str, request: Request):
         last = last_price.get(p.symbol)
         pnl = round((last - p.avg_cost) / p.avg_cost * 100, 2) \
             if (last is not None and p.avg_cost) else None
+        pnl_amt = round((last - p.avg_cost) * p.qty, 2) \
+            if last is not None else None
         positions.append({
             "symbol": p.symbol, "qty": p.qty, "avg_cost": p.avg_cost,
             "name": name_map.get(p.symbol) or p.symbol,
-            "last_price": last, "pnl_pct": pnl,
+            "last_price": last, "pnl_pct": pnl, "pnl": pnl_amt,
         })
     for t in trades:
         t["name"] = name_map.get(t["symbol"]) or t["symbol"]
