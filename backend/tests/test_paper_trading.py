@@ -15,7 +15,8 @@ from app.paper.scheduler import PaperScheduler, _simulate
 from app.paper.service import MarketDataNotReadyError, run_simulate
 from app.paper.store import PaperStore
 from app.paper.trading import (_exit_fill_price, attach_trade_pnl, decide_exit,
-                               entry_signal_passes, process_day)
+                               entry_signal_passes, process_day,
+                               replay_account)
 
 
 class FakeMarket:
@@ -950,6 +951,38 @@ def test_attach_trade_pnl_replays_average_cost():
     assert trades[3]["pnl"] is None
     assert trades[4]["pnl"] == pytest.approx(-100.0), "(19-20)×100"
     assert trades[5]["pnl"] is None, "卖出超出回放持仓时应为 None"
+
+
+def test_replay_account_recomputes_hold_days():
+    """删除交易后的账户回放: 重建现金/持仓/均价, 并按已结算日重算 hold_days。
+
+    回归场景: dde_01 删除一笔卖出后回放把 hold_days 清零, 导致
+    max_hold_days=1 的持仓次日不卖出（晚一个交易日）。
+    """
+    acc = make_account()
+    acc.last_record_date = "2026-09-16"
+    trades = [
+        {"symbol": "000978.SZ", "side": "buy", "qty": 300, "price": 10.33,
+         "date": "2026-09-14"},
+        {"symbol": "000978.SZ", "side": "buy", "qty": 300, "price": 11.56,
+         "date": "2026-09-15"},
+        {"symbol": "000978.SZ", "side": "sell", "qty": 300, "price": 11.56,
+         "date": "2026-09-15"},
+        {"symbol": "001896.SZ", "side": "buy", "qty": 200, "price": 13.45,
+         "date": "2026-09-15"},
+    ]
+    replay_account(acc, trades, ["2026-09-14", "2026-09-15", "2026-09-16"])
+    p = acc.positions["000978.SZ"]
+    assert p.qty == 300 and p.entry_date == "2026-09-14"
+    assert p.avg_cost == pytest.approx(10.945), "两笔买入摊薄 (10.33+11.56)/2"
+    assert p.hold_days == 3, "09-14 建仓, 经历 09-14/15/16 三个结算日"
+    assert acc.positions["001896.SZ"].hold_days == 2, "09-15 建仓, 经历两个结算日"
+    assert acc.cash == pytest.approx(100000 - 10.33 * 300 - 11.56 * 300
+                                     - 13.45 * 200 + 11.56 * 300)
+    # 无已结算日（last_record_date 为空）时 hold_days 归零
+    acc2 = make_account()
+    replay_account(acc2, trades[:1], ["2026-09-14"])
+    assert acc2.positions["000978.SZ"].hold_days == 0, "无 last_record_date 时为 0"
 
 
 # ── sell_time=next_open（次日开盘价卖出） ────────────────

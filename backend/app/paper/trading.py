@@ -397,6 +397,50 @@ def attach_trade_pnl(trades: list[dict]) -> None:
         t["pnl"] = pnl
 
 
+def replay_account(acc: Account, trades: list[dict],
+                   settled_dates: list[str] | None = None) -> None:
+    """从初始资金按流水重放，重建现金与持仓（删除交易后用于修正账户状态）。
+
+    买入累计均价、卖出按当时均价减仓（与引擎 Position.avg_cost 口径一致）。
+    持有天数无法从流水推导（增量结算按日累加），按 settled_dates（该策略
+    已结算的交易日快照日期）重算：entry_date 与账户 last_record_date 之间
+    （含两端）经历的结算日数；无 last_record_date 时为 0。
+    """
+    acc.cash = acc.initial_cash
+    acc.positions = {}
+    for t in trades:
+        try:
+            qty = int(t.get("qty") or 0)
+            price = float(t.get("price") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        sym = t.get("symbol")
+        if not sym or qty <= 0 or price <= 0:
+            continue
+        if t.get("side") == "buy":
+            cost = qty * price
+            acc.cash -= cost
+            pos = acc.positions.get(sym)
+            if pos is None:
+                acc.positions[sym] = Position(sym, qty, price, str(t.get("date") or ""))
+            else:
+                tq = pos.qty + qty
+                pos.avg_cost = (pos.avg_cost * pos.qty + cost) / tq
+                pos.qty = tq
+        else:
+            acc.cash += qty * price
+            pos = acc.positions.get(sym)
+            if pos is not None:
+                pos.qty -= qty
+                if pos.qty <= 0:
+                    del acc.positions[sym]
+    settled = sorted(settled_dates or [])
+    upper = acc.last_record_date or ""
+    for pos in acc.positions.values():
+        pos.hold_days = sum(1 for d in settled
+                            if pos.entry_date and pos.entry_date <= d <= upper)
+
+
 def _align_symbol_keys(rows: dict[str, DayRow], candidates: list[str],
                        iwencai_rows: dict[str, dict] | None
                        ) -> tuple[list[str], dict[str, dict] | None]:

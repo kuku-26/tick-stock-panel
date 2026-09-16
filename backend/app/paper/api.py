@@ -17,7 +17,7 @@ from .fields import (IWENCAI_FIELD_CATALOG, available_fields,
 from .iwencai_service import run_query
 from .models import (Account, BuyRule, LOT, PaperStrategy, Position,
                      SellRule, TradeRecord, make_id, validate_id)
-from .trading import attach_trade_pnl
+from .trading import attach_trade_pnl, replay_account
 
 logger = logging.getLogger(__name__)
 
@@ -230,34 +230,9 @@ def delete_trade(account_id: str, trade_id: str, request: Request):
     remaining = [t for t in trades if t.get("id") != trade_id]
 
     acc = accounts[account_id]
-    acc.cash = acc.initial_cash
-    acc.positions = {}
-    for t in remaining:
-        try:
-            qty = int(t.get("qty") or 0)
-            price = float(t.get("price") or 0.0)
-        except (TypeError, ValueError):
-            continue
-        sym = t.get("symbol")
-        if not sym or qty <= 0 or price <= 0:
-            continue
-        if t.get("side") == "buy":
-            cost = qty * price
-            acc.cash -= cost
-            if sym in acc.positions:
-                pos = acc.positions[sym]
-                tq = pos.qty + qty
-                pos.avg_cost = (pos.avg_cost * pos.qty + cost) / tq
-                pos.qty = tq
-            else:
-                acc.positions[sym] = Position(sym, qty, price, str(t.get("date") or ""))
-        else:
-            acc.cash += qty * price
-            if sym in acc.positions:
-                pos = acc.positions[sym]
-                pos.qty -= qty
-                if pos.qty <= 0:
-                    del acc.positions[sym]
+    # 回放重建现金/持仓，并按该策略已结算快照日期重算各持仓 hold_days
+    # （回放无法从流水推导持有天数，见 trading.replay_account 文档）
+    replay_account(acc, remaining, store.list_day_dates(bound.id))
     store.rewrite_trades(bound.id, remaining)
     store.save_accounts(accounts)
     logger.info("paper delete trade %s (account %s): replayed %d trades",
