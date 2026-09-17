@@ -400,6 +400,18 @@ def attach_trade_pnl(trades: list[dict]) -> None:
         t["pnl_pct"] = pnl_pct
 
 
+def hold_days_since(entry_date: str | None, settled_dates, upper: str | None) -> int:
+    """按已结算快照日期计算持有天数：entry_date 与 upper 之间（含两端）的结算日数。
+
+    与引擎口径一致（建仓日参与当日结算，结算后为 1）；删除回放与手动补录
+    建仓共用本函数，避免两条路径的持有天数语义漂移。
+    """
+    if not entry_date:
+        return 0
+    upper = upper or ""
+    return sum(1 for d in set(settled_dates or ()) if entry_date <= d <= upper)
+
+
 def replay_account(acc: Account, trades: list[dict],
                    settled_dates: list[str] | None = None) -> None:
     """从初始资金按流水重放，重建现金与持仓（删除交易后用于修正账户状态）。
@@ -438,10 +450,9 @@ def replay_account(acc: Account, trades: list[dict],
                 if pos.qty <= 0:
                     del acc.positions[sym]
     settled = sorted(settled_dates or [])
-    upper = acc.last_record_date or ""
     for pos in acc.positions.values():
-        pos.hold_days = sum(1 for d in settled
-                            if pos.entry_date and pos.entry_date <= d <= upper)
+        pos.hold_days = hold_days_since(pos.entry_date, settled,
+                                        acc.last_record_date)
 
 
 def _align_symbol_keys(rows: dict[str, DayRow], candidates: list[str],

@@ -10,7 +10,7 @@ from app.paper import context
 from app.paper.api import (AccountUpdateModel, ManualTradeModel,
                            account_detail, manual_trade, update_account)
 from app.paper.market import DayRow
-from app.paper.models import Account, PaperStrategy
+from app.paper.models import Account, DaySnapshot, PaperStrategy
 from app.paper.store import PaperStore
 
 
@@ -65,6 +65,40 @@ def test_manual_trade_appends_record_to_bound_strategy(tmp_path):
     assert trades[0]["reason"] == "manual"
     assert trades[0]["symbol"] == "600000.SH"
     assert trades[0]["side"] == "buy"
+
+
+def test_manual_buy_backfilled_date_recomputes_hold_days(tmp_path):
+    """手动补录历史日期的买入应视同该日建仓重算 hold_days（与引擎/回放同口径）。
+
+    回归场景: dde_01 手动补录 09-16 买入 000993 后 hold_days=0，导致
+    max_hold_days=1 的持仓次日结算不卖出（晚一个交易日）。
+    """
+    store = _seed(tmp_path)
+    acc = store.load_accounts()["acc1"]
+    acc.last_record_date = "2026-09-16"
+    store.save_accounts({"acc1": acc})
+    for d in ("2026-09-15", "2026-09-16"):
+        store.save_day(DaySnapshot("acc1", "s1", d, 100000.0, {}, 0.0, 100000.0, 1.0))
+
+    # 补录 09-15 的买入: 经历 09-15/16 两个结算日 → hold_days=2
+    manual_trade("acc1", ManualTradeModel(symbol="600000.SH", side="buy",
+                                          qty=100, price=10.0, date="2026-09-15"), None)
+    pos = store.load_accounts()["acc1"].positions["600000.SH"]
+    assert pos.entry_date == "2026-09-15"
+    assert pos.hold_days == 2, "09-15 建仓, 经历 09-15/16 两个结算日"
+
+    # 补录日期晚于最后结算日（未结算）→ hold_days=0, 待当日结算后 +1
+    manual_trade("acc1", ManualTradeModel(symbol="000001.SZ", side="buy",
+                                          qty=100, price=10.0, date="2026-09-17"), None)
+    pos2 = store.load_accounts()["acc1"].positions["000001.SZ"]
+    assert pos2.hold_days == 0, "买入日期晚于最后结算日时为 0"
+
+    # 加仓已有持仓不改变原 entry_date 与 hold_days
+    manual_trade("acc1", ManualTradeModel(symbol="600000.SH", side="buy",
+                                          qty=100, price=11.0, date="2026-09-16"), None)
+    pos3 = store.load_accounts()["acc1"].positions["600000.SH"]
+    assert pos3.qty == 200 and pos3.entry_date == "2026-09-15"
+    assert pos3.hold_days == 2
 
 
 # ── 账户详情：持仓名称/现价/收益率与流水名称 ──────────────

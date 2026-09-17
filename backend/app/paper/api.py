@@ -17,7 +17,7 @@ from .fields import (IWENCAI_FIELD_CATALOG, available_fields,
 from .iwencai_service import run_query
 from .models import (Account, BuyRule, LOT, PaperStrategy, Position,
                      SellRule, TradeRecord, make_id, validate_id)
-from .trading import attach_trade_pnl, replay_account
+from .trading import attach_trade_pnl, hold_days_since, replay_account
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +169,10 @@ def manual_trade(account_id: str, req: ManualTradeModel, request: Request):
         raise HTTPException(status_code=400, detail="价格必须大于 0")
     date = req.date.strip() or _date.today().isoformat()
 
+    # 绑定策略（流水归属 + 已结算快照日期来源）
+    bound = next((s for s in store.load_strategies().values()
+                  if s.account_id == account_id), None)
+
     if req.side == "buy":
         cost = req.qty * req.price
         if acc.cash + 1e-9 < cost:
@@ -181,7 +185,13 @@ def manual_trade(account_id: str, req: ManualTradeModel, request: Request):
             pos.avg_cost = (pos.avg_cost * pos.qty + cost) / tq
             pos.qty = tq
         else:
-            acc.positions[symbol] = Position(symbol, req.qty, req.price, date)
+            pos = Position(symbol, req.qty, req.price, date)
+            # 手动补录历史日期的买入视同该日建仓：按已结算快照重算持有天数
+            # （与引擎/删除回放同口径），否则 max_hold 判定会晚一个交易日
+            if bound is not None:
+                pos.hold_days = hold_days_since(date, store.list_day_dates(bound.id),
+                                                acc.last_record_date)
+            acc.positions[symbol] = pos
     else:
         pos = acc.positions.get(symbol)
         if pos is None or pos.qty < req.qty:
@@ -195,8 +205,6 @@ def manual_trade(account_id: str, req: ManualTradeModel, request: Request):
     store.save_accounts(accounts)
 
     # 追加一条人工成交到绑定策略的流水（保证列表可见、级联删除一致）
-    bound = next((s for s in store.load_strategies().values()
-                  if s.account_id == account_id), None)
     if bound is not None:
         tr = TradeRecord(make_id("t"), account_id, bound.id, date, symbol,
                          req.side, req.qty, req.price,
