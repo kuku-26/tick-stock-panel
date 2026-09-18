@@ -424,8 +424,28 @@ def fetch_now(strategy_id: str, request: Request):
     return {"ok": True, **result}
 
 
-# 说明: 不提供手动结算端点 —— 结算只由 simulate_time 定时任务执行。
-# 提前手动结算会用未确定的当日价格成交, 打乱策略时序 (T+1/收盘价语义)。
+@router.post("/strategies/{strategy_id}/settle")
+def settle_now(strategy_id: str, request: Request):
+    """手动结算今天（定时结算被跳过时的补救入口，如盘后行情落盘晚于 simulate_time）。
+
+    防重入：当日已有结算快照时拒绝，避免重复成交与持有天数重复累加；
+    行情未就绪（MarketDataNotReadyError）返回 503，由用户稍后重试。
+    """
+    store = _store(request)
+    strategy = store.load_strategies().get(strategy_id)
+    if strategy is None:
+        raise HTTPException(status_code=404, detail="策略不存在")
+    d = _date.today().isoformat()
+    if store.load_day(d, strategy_id) is not None:
+        raise HTTPException(status_code=409, detail=f"{d} 已结算，无需重复结算")
+    try:
+        result = service.run_simulate(store, _market(request), strategy, d)
+    except service.MarketDataNotReadyError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"结算失败: {e}")
+    logger.info("paper manual settle %s: %s", strategy_id, result)
+    return {"ok": True, **result}
 
 
 # ── 查询 ────────────────────────────────────────────────
@@ -506,6 +526,33 @@ def latest_snapshot(strategy_id: str, request: Request):
     symbols = snap.get("symbols") or []
     lst = [{"symbol": s, "name": (fields.get(s) or {}).get("name", "")} for s in symbols]
     return {"date": dates[-1], "symbols": lst, "count": len(lst)}
+
+
+@router.get("/records")
+def daily_records(request: Request, date: str | None = None):
+    """按日汇总各策略的选股与结算记录（顶部"今日记录"弹窗用，date 默认今天）。
+
+    选股取自问财快照（代码+名称），结算取自日快照（资金/净值/当日成交）；
+    对应日期未落盘时 fetch.done=False / settle=None，便于前端展示未拉取/未结算。
+    """
+    store = _store(request)
+    d = date or _date.today().isoformat()
+    records = []
+    for sid, s in store.load_strategies().items():
+        snap = store.load_iwencai_snapshot(d, sid)
+        fields = (snap or {}).get("fields") or {}
+        symbols = [{"symbol": c, "name": (fields.get(c) or {}).get("name", "")}
+                   for c in (snap or {}).get("symbols", [])]
+        day = store.load_day(d, sid)
+        records.append({
+            "strategy_id": sid, "name": s.name,
+            "fetch": {"done": snap is not None, "count": len(symbols), "symbols": symbols},
+            "settle": None if day is None else {
+                "cash": day.get("cash"), "total_value": day.get("total_value"),
+                "nav": day.get("nav"), "trades": day.get("trades", []),
+            },
+        })
+    return {"date": d, "records": records}
 
 
 @router.get("/account/{account_id}/detail")
@@ -591,6 +638,7 @@ def account_detail(account_id: str, request: Request):
             if last is not None else None
         positions.append({
             "symbol": p.symbol, "qty": p.qty, "avg_cost": p.avg_cost,
+            "hold_days": p.hold_days,
             "name": name_map.get(p.symbol) or p.symbol,
             "last_price": last, "pnl_pct": pnl, "pnl": pnl_amt,
         })

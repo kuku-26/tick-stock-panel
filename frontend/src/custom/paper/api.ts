@@ -125,6 +125,7 @@ export interface AccountPosition {
   symbol: string
   qty: number
   avg_cost: number
+  hold_days?: number
   name?: string | null
   last_price?: number | null
   pnl_pct?: number | null
@@ -151,6 +152,45 @@ export interface SnapshotSheet {
   rows: Array<Record<string, unknown>>
   columns: string[]
   count: number
+}
+
+export interface DailyRecordTrade {
+  id?: string
+  symbol: string
+  side: 'buy' | 'sell'
+  qty: number
+  price: number
+  amount: number
+  reason: string
+}
+
+export interface DailyRecord {
+  strategy_id: string
+  name: string
+  fetch: { done: boolean; count: number; symbols: Array<{ symbol: string; name: string }> }
+  settle: {
+    cash: number | null
+    total_value: number | null
+    nav: number | null
+    trades: DailyRecordTrade[]
+  } | null
+}
+
+export interface DailyRecords {
+  date: string
+  records: DailyRecord[]
+}
+
+export interface SettleResult {
+  date: string
+  candidates: number
+  trades: number
+  buy: number
+  sell: number
+  cash: number
+  positions: number
+  total_value: number
+  nav: number
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -211,8 +251,13 @@ export const paperApi = {
     return req<SnapshotSheet>(`/strategies/${id}/snapshot${q}`)
   },
 
-  fetchNow: (id: string) =>
-    req<{ ok: boolean }>(`/strategies/${id}/fetch`, { method: 'POST' }),
+  records: (date?: string) => {
+    const q = date ? `?date=${encodeURIComponent(date)}` : ''
+    return req<DailyRecords>(`/records${q}`)
+  },
+
+  settle: (id: string) =>
+    req<SettleResult & { ok: boolean }>(`/strategies/${id}/settle`, { method: 'POST' }),
 
   equity: (id: string) =>
     req<{ equity: Array<{ date: string; nav: number | null; total_value: number | null }> }>(

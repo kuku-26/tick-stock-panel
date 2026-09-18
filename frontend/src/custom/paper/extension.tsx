@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
-import { ChevronDown, ChevronUp, LineChart, Wallet, Save, Trash2, RefreshCw, Settings2, Loader2, Plus, Pencil, History } from 'lucide-react'
+import { ChevronDown, ChevronUp, LineChart, Wallet, Save, Trash2, RefreshCw, Settings2, Loader2, Plus, Pencil, History, CalendarCheck } from 'lucide-react'
 import type { FrontendExtension } from '@/extensions/types'
-import { paperApi, type Account, type AccountDay, type AccountDetail, type BuyRule, type FieldOption, type ManualTrade, type PaperStrategy, type SellRule, type SignalOption, type SnapshotSheet } from './api'
+import { paperApi, type Account, type AccountDay, type AccountDetail, type BuyRule, type DailyRecords, type FieldOption, type ManualTrade, type PaperStrategy, type SellRule, type SignalOption, type SnapshotSheet } from './api'
 
 // 交易原因代码 → 中文展示（后端代码保持稳定，历史流水兼容）
 const REASON_LABELS: Record<string, string> = {
@@ -479,7 +479,7 @@ function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade, onDelet
           <table className="w-full text-left text-xs">
             <thead>
               <tr className="text-secondary border-b border-border">
-                <th className="py-1">代码</th><th>名称</th><th>数量</th><th>成本价</th><th>现价</th><th>盈亏金额</th><th>收益率</th>
+                <th className="py-1">代码</th><th>名称</th><th>数量</th><th>成本价</th><th>现价</th><th>持仓天数</th><th>盈亏金额</th><th>收益率</th>
               </tr>
             </thead>
             <tbody>
@@ -490,6 +490,7 @@ function AccountDetailPanel({ detail, settleTime, onEdit, onManualTrade, onDelet
                   <td>{p.qty}</td>
                   <td>{p.avg_cost}</td>
                   <td>{p.last_price ?? '-'}</td>
+                  <td>{p.hold_days ?? '-'}</td>
                   <td>{p.pnl != null
                     ? <span className={p.pnl >= 0 ? 'text-red-300' : 'text-emerald-300'}>{p.pnl.toFixed(2)}</span>
                     : <span className="text-muted">-</span>}</td>
@@ -627,7 +628,7 @@ function SnapshotSheetModal({ strategyId, name, onClose }: {
         {err && <div className="text-xs text-red-400">{err}</div>}
         {!data && !err && <div className="text-xs text-muted">加载中…</div>}
         {data && data.rows.length === 0 && (
-          <div className="text-xs text-muted">暂无问财快照，或尚未到定时选股时间。可点击「拉取」手动获取一次。</div>
+          <div className="text-xs text-muted">暂无问财快照，或尚未到定时选股时间。</div>
         )}
         {data && data.rows.length > 0 && <SnapshotTable data={data} />}
       </div>
@@ -716,11 +717,98 @@ function HistoryPanelModal({ strategies, initialStrategyId, onClose }: {
   )
 }
 
-function StrategyCard({ s, onOpen, onPatch, onFetch, onDelete, onEditAccount, onManualTrade }: {
+function TodayRecordsModal({ onClose }: { onClose: () => void }) {
+  // 今日运行记录：结算（日快照：资金/净值/当日成交）+ 选股（问财快照：候选名单）
+  const [data, setData] = useState<DailyRecords | null>(null)
+  const [err, setErr] = useState('')
+  useEffect(() => {
+    let alive = true
+    paperApi.records()
+      .then(d => alive && setData(d))
+      .catch(e => alive && setErr(String(e)))
+    return () => { alive = false }
+  }, [])
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/50 p-6 overflow-auto" onClick={onClose}>
+      <div className="rounded-btn bg-elevated border border-border p-4 flex flex-col gap-3 w-full max-w-3xl max-h-[85vh] overflow-auto" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between">
+          <span className="text-sm font-medium flex items-center gap-1">
+            <CalendarCheck size={14} /> 今日运行记录{data?.date ? `（${data.date}）` : ''}
+          </span>
+          <button onClick={onClose} className="text-xs text-secondary hover:text-foreground">× 关闭</button>
+        </div>
+        {err && <div className="text-xs text-red-400">{err}</div>}
+        {!data && !err && <div className="text-xs text-muted">加载中…</div>}
+        {data && data.records.length === 0 && <div className="text-xs text-muted">暂无策略。</div>}
+        {data && data.records.map(r => {
+          const t = r.settle
+          return (
+            <div key={r.strategy_id} className="rounded-btn border border-border p-3 flex flex-col gap-2">
+              <div className="flex flex-wrap items-center justify-between gap-1">
+                <span className="text-sm font-medium">{r.name}</span>
+                {t ? (
+                  <span className="text-[11px] text-secondary">
+                    净值 {t.nav ?? '—'} · 总资产 {t.total_value ?? '—'} · 现金 {t.cash ?? '—'}
+                  </span>
+                ) : (
+                  <span className="text-[11px] text-amber-300">今日未结算（未到结算时间或行情未就绪被跳过，可在策略卡片点「结算」手动补结算）</span>
+                )}
+              </div>
+              {t && (t.trades.length > 0 ? (
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="text-secondary border-b border-border">
+                      <th className="text-left py-1 font-normal">方向</th>
+                      <th className="text-left font-normal">代码</th>
+                      <th className="text-right font-normal">数量</th>
+                      <th className="text-right font-normal">价格</th>
+                      <th className="text-right font-normal">金额</th>
+                      <th className="text-left pl-3 font-normal">原因</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {t.trades.map((tr, i) => (
+                      <tr key={tr.id ?? i} className="border-b border-border/50">
+                        <td className={`py-1 ${tr.side === 'buy' ? 'text-red-300' : 'text-emerald-300'}`}>
+                          {tr.side === 'buy' ? '买入' : '卖出'}
+                        </td>
+                        <td>{tr.symbol}</td>
+                        <td className="text-right">{tr.qty}</td>
+                        <td className="text-right">{tr.price}</td>
+                        <td className="text-right">{tr.amount}</td>
+                        <td className="pl-3 text-secondary">{REASON_LABELS[tr.reason] ?? tr.reason}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <div className="text-xs text-muted">今日无成交（未触发买卖条件）。</div>
+              ))}
+              <div className="text-xs text-secondary">
+                <span className="text-muted">选股：</span>
+                {r.fetch.done ? `${r.fetch.count} 只` : '今日未落盘（未到定时选股时间或拉取失败）'}
+              </div>
+              {r.fetch.done && r.fetch.symbols.length > 0 && (
+                <div className="flex flex-wrap gap-1">
+                  {r.fetch.symbols.map(sym => (
+                    <span key={sym.symbol} className="px-1.5 py-0.5 rounded bg-elevated border border-border text-[11px]">
+                      {sym.name ? `${sym.symbol} ${sym.name}` : sym.symbol}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function StrategyCard({ s, onOpen, onPatch, onDelete, onEditAccount, onManualTrade }: {
   s: PaperStrategy
   onOpen: () => void
   onPatch: (patch: Partial<PaperStrategy>) => void
-  onFetch: () => void | Promise<void>
   onDelete: () => void
   onEditAccount: (accountId: string) => void
   onManualTrade: (account: Account) => void
@@ -728,8 +816,6 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onDelete, onEditAccount, on
   const [detail, setDetail] = useState<AccountDetail | null>(null)
   const [showSheet, setShowSheet] = useState(false)
   const [showDetail, setShowDetail] = useState(true)
-  const [confirmFetch, setConfirmFetch] = useState<{ latest: string | null } | null>(null)
-  const [checking, setChecking] = useState(false)
   useEffect(() => {
     let alive = true
     setDetail(null)
@@ -743,33 +829,6 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onDelete, onEditAccount, on
     return () => { alive = false; clearInterval(timer) }
   }, [s.id, s.account_id])
 
-  const todayStr = () => {
-    const d = new Date()
-    const p = (n: number) => String(n).padStart(2, '0')
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
-  }
-  // 「拉取」优先复用当天落盘数据；当天没有落盘才询问是否实时拉取问财
-  const handleFetch = async () => {
-    if (checking) return
-    setChecking(true)
-    try {
-      const sheet = await paperApi.snapshot(s.id)
-      if (sheet.date === todayStr()) {
-        setShowSheet(true) // 当天已落盘 → 直接展示落盘明细
-        return
-      }
-      setConfirmFetch({ latest: sheet.date })
-    } catch {
-      setConfirmFetch({ latest: null })
-    } finally {
-      setChecking(false)
-    }
-  }
-  const confirmFetchNow = async () => {
-    setConfirmFetch(null)
-    await onFetch()
-    setShowSheet(true) // 拉取落盘完成后展示当日明细
-  }
   // 删除一笔交易: 后端按剩余流水回放重建资金/持仓, 前端刷新详情
   const handleDeleteTrade = async (tradeId: string) => {
     if (!detail) return
@@ -777,6 +836,18 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onDelete, onEditAccount, on
     try {
       await paperApi.deleteTrade(detail.account.id, tradeId)
       setDetail(await paperApi.accountDetail(detail.account.id))
+    } catch (e) { window.alert(String(e)) }
+  }
+
+  // 手动补结算（定时结算被行情未就绪跳过时）; 当日已结算会被后端拒绝
+  const handleSettle = async () => {
+    if (!window.confirm('立即结算今天？\n用于定时结算被跳过时手动补结算；若当日已结算会被拒绝。')) return
+    try {
+      const r = await paperApi.settle(s.id)
+      window.alert(`结算完成：成交 ${r.trades} 笔（买 ${r.buy}/卖 ${r.sell}），净值 ${r.nav}`)
+      if (s.account_id) {
+        try { setDetail(await paperApi.accountDetail(s.account_id)) } catch { /* 30s 定时刷新兜底 */ }
+      }
     } catch (e) { window.alert(String(e)) }
   }
 
@@ -825,8 +896,8 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onDelete, onEditAccount, on
         <button onClick={() => setShowSheet(true)} className="inline-flex items-center gap-1 h-7 px-2 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground hover:bg-elevated/80">
           <LineChart size={12} /> 选股名单
         </button>
-        <button onClick={handleFetch} disabled={checking} className="inline-flex items-center gap-1 h-7 px-2 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground hover:bg-elevated/80 disabled:opacity-50">
-          <RefreshCw size={12} /> 拉取
+        <button onClick={handleSettle} className="inline-flex items-center gap-1 h-7 px-2 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground hover:bg-elevated/80">
+          <RefreshCw size={12} /> 结算
         </button>
         <button onClick={onDelete} className="ml-auto inline-flex items-center gap-1 h-7 px-2 rounded-btn text-xs text-red-400 hover:bg-red-500/10">
           <Trash2 size={12} />
@@ -841,23 +912,6 @@ function StrategyCard({ s, onOpen, onPatch, onFetch, onDelete, onEditAccount, on
       )}
       {showSheet && (
         <SnapshotSheetModal strategyId={s.id} name={s.name} onClose={() => setShowSheet(false)} />
-      )}
-      {confirmFetch && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={() => setConfirmFetch(null)}>
-          <div className="rounded-btn bg-elevated border border-border p-4 flex flex-col gap-3 w-full max-w-sm" onClick={e => e.stopPropagation()}>
-            <span className="text-sm font-medium">同步问财选股</span>
-            <div className="text-xs text-secondary leading-relaxed">
-              {confirmFetch.latest
-                ? <>今天（{todayStr()}）还没有落盘选股数据，最新落盘为 <b>{confirmFetch.latest}</b>。</>
-                : '该策略还没有任何落盘选股数据。'}
-              是否实时拉取问财并落盘？
-            </div>
-            <div className="flex justify-end gap-2 pt-1">
-              <button onClick={() => setConfirmFetch(null)} className="h-7 px-3 rounded-btn text-xs bg-elevated text-secondary">取消</button>
-              <button onClick={confirmFetchNow} className="h-7 px-3 rounded-btn text-xs bg-primary text-primary-foreground">拉取并落盘</button>
-            </div>
-          </div>
-        </div>
       )}
     </div>
   )
@@ -973,6 +1027,7 @@ function PaperPage() {
   const [manualAcc, setManualAcc] = useState<Account | null>(null)
   const [manualDraft, setManualDraft] = useState<ManualTrade>({ symbol: '', side: 'buy', qty: 100, price: 0, date: '' })
   const [showHistory, setShowHistory] = useState(false)
+  const [showRecords, setShowRecords] = useState(false)
 
   const load = async () => {
     const [a, s, opt] = await Promise.all([paperApi.accounts(), paperApi.strategies(), paperApi.options()])
@@ -983,10 +1038,6 @@ function PaperPage() {
   }, [])
 
   const flash = (m: string) => { setMsg(m); setTimeout(() => setMsg(''), 4000) }
-
-  const act = async (fn: () => Promise<unknown>, ok: string) => {
-    try { await fn(); await load(); flash(ok) } catch (e) { flash(String(e)) }
-  }
 
   // 打开策略编辑器：新策略仅用静态字段；编辑已存策略时并入其最近快照字段（快照回退）
   const openEditor = async (s: PaperStrategy | null) => {
@@ -1084,6 +1135,10 @@ function PaperPage() {
           <Wallet size={18} /> 问财实盘模拟
         </h1>
         <span className="flex items-center gap-2">
+          <button onClick={() => setShowRecords(true)} disabled={!strategies.length}
+            className="inline-flex items-center gap-1 h-8 px-3 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground disabled:opacity-50">
+            <CalendarCheck size={13} /> 今日记录
+          </button>
           <button onClick={() => setShowHistory(true)} disabled={!strategies.length}
             className="inline-flex items-center gap-1 h-8 px-3 rounded-btn bg-elevated text-xs text-secondary hover:text-foreground disabled:opacity-50">
             <History size={13} /> 选股历史
@@ -1099,13 +1154,15 @@ function PaperPage() {
       {showHistory && (
         <HistoryPanelModal strategies={strategies} onClose={() => setShowHistory(false)} />
       )}
+      {showRecords && (
+        <TodayRecordsModal onClose={() => setShowRecords(false)} />
+      )}
 
       <div className="flex flex-col gap-3">
         {strategies.map(s => (
           <StrategyCard key={s.id} s={s}
             onOpen={() => openEdit(s)}
             onPatch={patch => onPatchStrategy(s.id, patch)}
-            onFetch={() => act(() => paperApi.fetchNow(s.id), `已拉取选股：${s.name}`)}
             onDelete={() => removeStrategy(s)}
             onEditAccount={openAccountEdit}
             onManualTrade={openManualTrade} />

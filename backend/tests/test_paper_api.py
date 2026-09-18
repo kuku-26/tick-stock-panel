@@ -8,9 +8,10 @@ import pytest
 
 from app.paper import context
 from app.paper.api import (AccountUpdateModel, ManualTradeModel,
-                           account_detail, manual_trade, update_account)
+                           account_detail, daily_records, manual_trade,
+                           update_account)
 from app.paper.market import DayRow
-from app.paper.models import Account, DaySnapshot, PaperStrategy
+from app.paper.models import Account, DaySnapshot, PaperStrategy, TradeRecord
 from app.paper.store import PaperStore
 
 
@@ -99,6 +100,61 @@ def test_manual_buy_backfilled_date_recomputes_hold_days(tmp_path):
     pos3 = store.load_accounts()["acc1"].positions["600000.SH"]
     assert pos3.qty == 200 and pos3.entry_date == "2026-09-15"
     assert pos3.hold_days == 2
+
+
+def test_daily_records_aggregates_fetch_and_settlement(tmp_path):
+    """/records 按日汇总各策略的选股名单与结算记录；未落盘项显式标记。"""
+    store = _seed(tmp_path)
+    d = "2026-09-18"
+    store.save_iwencai_snapshot(d, "s1", {
+        "strategy_id": "s1", "symbols": ["000001"], "count": 1,
+        "fields": {"000001": {"name": "平安银行"}},
+    })
+    store.save_day(DaySnapshot("acc1", "s1", d, 99000.0, {}, 1000.0, 100000.0, 1.0,
+                               trades=[TradeRecord("t1", "acc1", "s1", d, "000001.SZ",
+                                                   "buy", 100, 10.0, 1000.0, "entry_fill")]))
+
+    out = daily_records(None, d)
+    assert out["date"] == d
+    rec = out["records"][0]
+    assert rec["strategy_id"] == "s1" and rec["name"] == "策略"
+    # 选股：已落盘 + 名称映射
+    assert rec["fetch"]["done"] is True
+    assert rec["fetch"]["count"] == 1
+    assert rec["fetch"]["symbols"][0] == {"symbol": "000001", "name": "平安银行"}
+    # 结算：日快照存在，成交明细透传
+    assert rec["settle"] is not None
+    assert rec["settle"]["total_value"] == 100000.0
+    assert rec["settle"]["trades"][0]["reason"] == "entry_fill"
+
+    # 无任何落盘的日期：done=False / settle=None
+    empty = daily_records(None, "2026-09-19")["records"][0]
+    assert empty["fetch"]["done"] is False and empty["settle"] is None
+
+
+def test_settle_now_guards(tmp_path):
+    """手动结算防重入与行情未就绪保护。"""
+    from datetime import date as _date
+
+    from fastapi import HTTPException
+
+    from app.paper.api import settle_now
+    from app.paper.market import MarketData
+
+    store = _seed(tmp_path)
+    context.set_instances(store, MarketData(tmp_path), None)
+
+    # 行情未就绪（空行情目录）→ 503
+    with pytest.raises(HTTPException) as ei:
+        settle_now("s1", None)
+    assert ei.value.status_code == 503
+
+    # 当日已结算 → 409 拒绝重复结算
+    d = _date.today().isoformat()
+    store.save_day(DaySnapshot("acc1", "s1", d, 100000.0, {}, 0.0, 100000.0, 1.0))
+    with pytest.raises(HTTPException) as ei:
+        settle_now("s1", None)
+    assert ei.value.status_code == 409
 
 
 # ── 账户详情：持仓名称/现价/收益率与流水名称 ──────────────
