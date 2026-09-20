@@ -6,7 +6,7 @@ focus 字段, 此处面向多轮对话, 故独立实现而非复用拼接)。
 """
 from __future__ import annotations
 
-from datetime import date
+from app.market_time import cn_today
 
 _SYSTEM_TEMPLATE = """\
 你是 Tick Stock Panel 的本地行情数据分析助手, 基于面板已落库的真实数据作答。
@@ -30,7 +30,10 @@ get_factor_values 查因子排名; 需要验证假设时 run_backtest。
 不重复查询同类信息。
 
 数据口径:
-- 工具返回的涨跌幅/换手率/振幅均为小数 (0.0366 = 3.66%), 表述时转为百分比。
+- 涨跌幅 change_pct 与振幅 amplitude 为小数 (0.0366 = 3.66%), 表述时转为百分比。
+- 换手率 turnover_rate 已是百分数 (5.2 = 5.2%), 直接加 % 表述, 不要再乘 100。
+- 指数实时行情 (get_indices 与 get_market_overview 的 indices) 的 change_pct / amplitude \
+已是百分数 (1.23 = 1.23%), 直接加 % 表述。
 - 大额金额换算为「亿/万亿」表述 (如 2.09e12 元 → 2.09 万亿), 价格保留两位小数。
 - 交代数据所处口径: 盘中是动态快照, 收盘口径以本地落库为准; \
 今天是非交易日或数据未更新时, 明确提示数据停留在最近哪个交易日。
@@ -62,4 +65,4 @@ def build_system_prompt(context: dict | None) -> str:
         if symbol:
             lines.append(f"- 用户正在关注的标的: {symbol}。")
     context_block = "\n".join(lines) if lines else "- 用户未提供页面上下文。"
-    return _SYSTEM_TEMPLATE.format(today=date.today().isoformat(), context=context_block)
+    return _SYSTEM_TEMPLATE.format(today=cn_today().isoformat(), context=context_block)
