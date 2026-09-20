@@ -247,11 +247,14 @@ def test_account_detail_resolves_bound_strategy(tmp_path):
     store.save_day(DaySnapshot("acc1", "strat1", "2026-09-04", 97000.0, {"000560": pos},
                                3000.0, 100000.0, 1.0, [trade]))
     pc.set_instances(store, None, None)
-    detail = account_detail("acc1", SimpleNamespace())
+    # 桩请求需带 app.state(quote_service 为 None → 现价/收益率回退 null)
+    fake_request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(quote_service=None)))
+    detail = account_detail("acc1", fake_request)
     assert detail["strategy_id"] == "strat1"
-    # 无维表/行情时名称回退为代码, 现价与收益率为 null
+    # 无维表/行情时名称回退为代码, 现价与收益率/盈亏为 null
     assert detail["positions"] == [{"symbol": "000560", "qty": 1000, "avg_cost": 3.0,
-                                    "name": "000560", "last_price": None, "pnl_pct": None}]
+                                    "hold_days": 1, "name": "000560",
+                                    "last_price": None, "pnl_pct": None, "pnl": None}]
     assert detail["days"][0]["total_value"] == 100000.0
     assert detail["trades"][0]["amount"] == 3000.0
     assert detail["trades"][0]["name"] == "000560"

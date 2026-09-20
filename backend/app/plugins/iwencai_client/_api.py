@@ -7,7 +7,7 @@ import logging
 import secrets
 import time
 
-import requests
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +61,10 @@ def fetch_page(api_key: str, query: str, page: int, perpage: int,
         "expand_index": "true",
     }
     try:
-        resp = requests.post(
+        resp = httpx.post(
             url, json=payload, headers=build_headers(api_key, call_type), timeout=timeout
         )
-    except requests.RequestException as e:
+    except httpx.HTTPError as e:
         raise IWencaiAPIError(f"网络错误: {e}") from e
 
     if resp.status_code != 200:
@@ -73,7 +73,7 @@ def fetch_page(api_key: str, query: str, page: int, perpage: int,
         except ValueError:
             body = resp.text
         raise IWencaiAPIError(
-            f"HTTP {resp.status_code}: {resp.reason}",
+            f"HTTP {resp.status_code}: {resp.reason_phrase}",
             status_code=resp.status_code,
             response=body,
         )
