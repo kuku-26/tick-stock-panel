@@ -31,9 +31,25 @@ def resolve_api_key(strategy: PaperStrategy) -> str:
 def run_fetch(store: PaperStore, strategy: PaperStrategy, when: str = "") -> dict:
     """拉取一次问财选股并落盘当日快照。
 
+    同问句去重：本策略当日快照缺失/为空，且已有其他同问句策略的非空快照时，
+    直接复用其数据落盘（跳过网关调用）——避免同 key 同分钟并发同款请求触发
+    网关偶发空结果，也节省调用次数。存储仍按策略独立落盘，读取方无需感知。
+
     底层接口为异步；本函数由同步上下文（API 线程池 / APScheduler 后台线程）调用，
     故用 asyncio.run 将协程跑到底。
     """
+    today = date.today().isoformat()
+    own = store.load_iwencai_snapshot(today, strategy.id)
+    if not (own and own.get("count")):
+        alt = _fallback_snapshot(store, strategy, today)
+        if alt is not None:
+            payload = {**alt, "strategy_id": strategy.id,
+                       "bucket": when or alt.get("bucket", "daily")}
+            store.save_iwencai_snapshot(today, strategy.id, payload)
+            logger.info("策略 %s 复用同问句策略的当日选股快照(%d 只), 跳过网关调用",
+                        strategy.name, payload.get("count", 0))
+            return {"symbols": payload.get("symbols", []),
+                    "count": payload.get("count", 0), "reused": True}
     strategy.api_key = resolve_api_key(strategy)
     return asyncio.run(iwencai_service.fetch_and_persist(store, strategy, when))
 
@@ -63,6 +79,11 @@ def run_simulate(store: PaperStore, market: MarketData, strategy: PaperStrategy,
         snap = store.load_iwencai_snapshot(date_str, strategy.id)
         candidates = (snap or {}).get("symbols", []) if snap else []
         iwencai_rows = (snap or {}).get("fields") if snap else None
+        if not candidates:
+            alt = _fallback_snapshot(store, strategy, date_str)
+            if alt is not None:
+                candidates = alt.get("symbols", [])
+                iwencai_rows = alt.get("fields")
 
     trades, snapshot = process_day(market, account, strategy, date_str, candidates, iwencai_rows)
     store.append_trades(strategy.id, trades)
@@ -78,6 +99,25 @@ def run_simulate(store: PaperStore, market: MarketData, strategy: PaperStrategy,
         "total_value": round(snapshot.total_value, 2),
         "nav": round(snapshot.nav, 4),
     }
+
+
+def _fallback_snapshot(store: PaperStore, strategy: PaperStrategy,
+                       date_str: str) -> dict | None:
+    """本策略当日选股快照缺失或为空时，复用同问句、已启用策略的非空快照。
+
+    场景：多个策略共用同一问句与抓取时间，网关偶发对同款并发请求返回空结果，
+    导致单策略当日无候选而错过买入；fields 按股票代码索引、与策略无关，可直接复用。
+    """
+    for sid, other in store.load_strategies().items():
+        if (sid == strategy.id or not other.enabled
+                or other.iwencai_query != strategy.iwencai_query):
+            continue
+        snap = store.load_iwencai_snapshot(date_str, sid)
+        if snap and snap.get("count"):
+            logger.warning("策略 %s 当日选股快照为空, 复用同问句策略 %s 的快照(%d 只)",
+                           strategy.name, other.name, snap.get("count"))
+            return snap
+    return None
 
 
 def _persist_account(store: PaperStore, account: Account) -> None:

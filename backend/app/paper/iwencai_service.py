@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import pandas as pd
@@ -14,6 +15,11 @@ from app.plugins.iwencai_client import IWencaiClient
 from .fields import normalize_rows, strip_col_date
 
 logger = logging.getLogger(__name__)
+
+# 网关偶发对并发/同时段请求返回 HTTP 200 但 datas 为空（同问句其他策略正常命中），
+# 空结果几乎必为瞬时异常 → 落盘前自动重试（共 3 次尝试, 线性退避 3s/6s）。
+EMPTY_RETRIES = 3
+EMPTY_RETRY_WAIT = 3
 
 # 问财返回数据中可能的股票代码列（按优先级，取第一个存在的）
 _CODE_COLS = ("股票代码", "代码", "证券代码", "代码[2026]")
@@ -63,7 +69,16 @@ async def fetch_and_persist(store, strategy, when: str = "") -> dict[str, Any]:
 
     返回汇总信息；网络/网关异常时抛 IWencaiAPIError。
     """
-    df, symbols = run_query(strategy.iwencai_query, strategy.api_key)
+    df, symbols = [], []
+    for attempt in range(1, EMPTY_RETRIES + 1):
+        df, symbols = run_query(strategy.iwencai_query, strategy.api_key)
+        if symbols:
+            break
+        if attempt < EMPTY_RETRIES:
+            wait = EMPTY_RETRY_WAIT * attempt
+            logger.warning("问财选股返回空结果, %ds 后重试(%d/%d): %s",
+                           wait, attempt, EMPTY_RETRIES - 1, strategy.name)
+            time.sleep(wait)
     records = df.to_dict(orient="records") if not df.empty else []
     # 落盘前清洗原始列名：去掉问财返回的日期后缀，如 dde大单净量[20260904] → dde大单净量
     records = [{strip_col_date(str(k)): v for k, v in r.items()} for r in records]
