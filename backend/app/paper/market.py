@@ -50,33 +50,14 @@ class MarketData:
 
     def __init__(self, storage_dir: Path):
         self._enriched = storage_dir / "kline_daily_enriched"
-        self._inst = storage_dir / "instruments" / "instruments.parquet"
-        self._limit_up: dict[str, float] = {}
         self._rows_cache: dict[tuple[str, tuple[str, ...]], dict[str, DayRow]] = {}
-        self._load_instruments()
 
-    # ── instruments / 涨停价 ────────────────────────────
-    def _load_instruments(self) -> None:
-        try:
-            if not self._inst.exists():
-                return
-            df = pl.read_parquet(self._inst).select(
-                [c for c in ("symbol", "limit_up") if c in pl.read_parquet(self._inst).columns]
-            )
-            if "symbol" in df.columns and "limit_up" in df.columns:
-                rows = df.to_dicts()
-                self._limit_up = {r["symbol"]: float(r["limit_up"])
-                                  for r in rows if r.get("limit_up")}
-        except Exception as e:
-            logger.warning("instruments load failed: %s", e)
-
-    def symbol_limit_up(self, symbol: str) -> float | None:
-        """标的当日涨停价；无维表时按板块启发式推算。"""
-        v = self._limit_up.get(symbol)
-        if v is not None:
-            return v
-        return None
-
+    # ── 涨跌停价 ────────────────────────────────────────
+    # 涨跌停判定统一用板块比例推算：prev_close 与 open 同为前复权价，比例判定
+    # 在复权空间自洽。不使用 instruments 维表的 limit_up——那是静态快照的真实价
+    # （不复权且会过期），与前复权行情比较属于口径错配（2026-09-22 中国长城
+    # 涨停开盘被误判可买的根因之一）。推算价按交易所口径取整到分（tick 0.01），
+    # 容差 0.005（半分钱）覆盖交易所四舍五入与 Python 银行家舍入的差异。
     @staticmethod
     def _heuristic_limit_up(symbol: str, prev_close: float | None) -> float | None:
         if prev_close is None or prev_close <= 0:
@@ -95,7 +76,7 @@ class MarketData:
             pct = 0.30
         else:
             pct = 0.10
-        return round(prev_close * (1 + direction * pct), 3)
+        return round(prev_close * (1 + direction * pct), 2)
 
     # ── enriched 日线 ─────────────────────────────────
     def day_rows(self, date: str,
@@ -210,13 +191,8 @@ class MarketData:
                 and row.high > 0 and row.low > 0 \
                 and abs(row.high - row.low) <= row.high * 1e-6:
             return False  # 一字板(最高=最低, 全天封死), 开盘无法买到
-        limit = self.symbol_limit_up(symbol)
-        heuristic = self._heuristic_limit_up(symbol, row.prev_close)
-        if limit is not None and heuristic is not None \
-                and abs(limit - heuristic) > heuristic * 0.02:
-            limit = None  # 维表涨停价与按比例推算偏差过大(过期/口径不符), 弃用
-        limit = limit or heuristic
-        if limit and row.open >= limit - 0.001:
+        limit = self._heuristic_limit_up(symbol, row.prev_close)
+        if limit and row.open >= limit - 0.005:
             return False  # 开盘即封涨停，无法买到
         return True
 
@@ -232,7 +208,7 @@ class MarketData:
             return False  # 停牌 / 无成交
         limit_dn = self._limit_price(symbol, row.prev_close, -1)
         return not (limit_dn is not None and row.open is not None and row.open > 0
-                    and row.open <= limit_dn + 0.001)  # 开盘即封跌停则不可卖
+                    and row.open <= limit_dn + 0.005)  # 开盘即封跌停则不可卖
 
     def limit_down_open_sell_price(self, symbol: str, row: DayRow | None) -> float | None:
         """「跌停打开卖出」成交价：开盘封跌停且盘中打开（高点>跌停价）→ 跌停价；否则 None。
@@ -244,10 +220,10 @@ class MarketData:
                 or row.close is None or row.close <= 0:
             return None  # 停牌 / 无成交
         dn = self._limit_price(symbol, row.prev_close, -1)
-        if dn is None or row.open > dn + 0.001:
+        if dn is None or row.open > dn + 0.005:
             return None  # 开盘不是跌停价
         high = row.high if (row.high is not None and row.high > 0) else None
-        if high is None or high <= dn + 0.001:
+        if high is None or high <= dn + 0.005:
             return None  # 全天封死，盘中未打开
         return dn
 
@@ -255,21 +231,16 @@ class MarketData:
         """「涨停打开买入」成交价：开盘封涨停且盘中打开（低点<涨停价）→ 涨停价；否则 None。
 
         买单按涨停价排队，盘中打开即按排队价（涨停价）成交，而非打开后的更低价。
-        涨停价口径与 buyable_at_open 一致（维表优先，偏差过大弃用后按板块推算）。
+        涨停价口径与 buyable_at_open 一致（板块比例推算, 与行情同复权口径）。
         """
         if row is None or row.open is None or row.open <= 0 \
                 or row.volume is None or row.volume <= 0:
             return None  # 停牌 / 无成交
-        limit = self.symbol_limit_up(symbol)
-        heuristic = self._heuristic_limit_up(symbol, row.prev_close)
-        if limit is not None and heuristic is not None \
-                and abs(limit - heuristic) > heuristic * 0.02:
-            limit = None  # 维表涨停价与推算偏差过大, 弃用
-        limit = limit or heuristic
-        if limit is None or row.open < limit - 0.001:
+        limit = self._heuristic_limit_up(symbol, row.prev_close)
+        if limit is None or row.open < limit - 0.005:
             return None  # 开盘不是涨停价
         low = row.low if (row.low is not None and row.low > 0) else None
-        if low is None or low >= limit - 0.001:
+        if low is None or low >= limit - 0.005:
             return None  # 全天封死，盘中未打开
         return limit
 

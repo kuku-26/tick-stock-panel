@@ -592,6 +592,23 @@ def test_market_buyable_at_open_rejects_one_word_board(tmp_path):
     assert mk.buyable_at_open("600000.SH", normal) is True
 
 
+def test_market_limit_up_open_rejected_for_rounded_down_limit(tmp_path):
+    """2026-09-22 中国长城回归: 涨停价向下取整(残差>旧容差0.001)时, 开盘涨停
+    必须判为封板不可买; 「涨停打开买入」开启时按涨停价排队成交。"""
+    mk = MarketData(tmp_path / "no_such_data")
+    # 真实行情: 昨收 14.84 → 涨停 14.84×1.1=16.324 → 交易所取整 16.32
+    row = DayRow(symbol="000066.SZ", open=16.32, close=15.87, volume=1000,
+                 high=16.32, low=15.60, prev_close=14.84)
+    assert mk.buyable_at_open("000066.SZ", row) is False, "开盘涨停应不可买"
+    assert mk.limit_up_open_buy_price("000066.SZ", row) == 16.32, "盘中炸板按涨停价排队"
+
+    # 未触及涨停的正常高开仍可买(+9%)
+    normal = DayRow(symbol="000066.SZ", open=16.18, close=16.0, volume=1000,
+                    high=16.30, low=15.90, prev_close=14.84)
+    assert mk.buyable_at_open("000066.SZ", normal) is True
+    assert mk.limit_up_open_buy_price("000066.SZ", normal) is None
+
+
 def test_same_open_skips_open_limit_up(tmp_path):
     """same_open 买入时开盘涨停/一字板跳过, 其余候选照常买入。"""
     mk = FakeMarket(
@@ -614,6 +631,90 @@ def test_same_open_skips_open_limit_up(tmp_path):
     bought = {t.symbol for t in trades if t.side == "buy"}
     assert bought == {"600000"}, "开盘涨停的 000523 应被跳过"
     assert "000523" not in snap.positions
+
+
+def test_run_simulate_falls_back_to_same_query_snapshot(tmp_path):
+    """本策略当日快照为空时, 复用同问句已启用策略的非空快照(网关偶发返回空结果)。"""
+    store = _seed_store(tmp_path)
+    accounts = store.load_accounts()
+    accounts["acc2"] = Account.create("acc2", "账户2", 100000.0)
+    store.save_accounts(accounts)
+    strategies = store.load_strategies()
+    strategies["strat2"] = PaperStrategy.create("strat2", "同问句", "acc2", "query")
+    store.save_strategies(strategies)
+    # strat1 当日空快照, strat2 正常命中 1 只
+    store.save_iwencai_snapshot("2026-01-02", "strat1",
+                                {"strategy_id": "strat1", "symbols": [], "count": 0,
+                                 "rows": [], "fields": {}})
+    store.save_iwencai_snapshot("2026-01-02", "strat2",
+                                {"strategy_id": "strat2", "symbols": ["000001"], "count": 1,
+                                 "rows": [], "fields": {"000001": {"name": "平安银行"}}})
+    s1 = store.load_strategies()["strat1"]
+    s1.buy_rule.buy_time = "same_open"  # 默认 next_open 当日只挂单不建仓
+    mk = FakeMarket({"2026-01-02": {"000001": r("000001", 10, 11)}})
+
+    result = run_simulate(store, mk, s1, "2026-01-02")
+
+    assert result["candidates"] == 1, "应复用 strat2 的非空快照"
+    assert "000001" in store.load_accounts()["acc1"].positions
+
+
+def test_run_simulate_no_fallback_when_query_differs_or_disabled(tmp_path):
+    """问句不同或对方策略已停用时, 不复用其快照。"""
+    store = _seed_store(tmp_path)
+    accounts = store.load_accounts()
+    accounts["acc2"] = Account.create("acc2", "账户2", 100000.0)
+    store.save_accounts(accounts)
+    strategies = store.load_strategies()
+    other = PaperStrategy.create("strat2", "不同问句", "acc2", "另一问句")
+    other.enabled = False  # 停用即不复用
+    strategies["strat2"] = other
+    store.save_strategies(strategies)
+    store.save_iwencai_snapshot("2026-01-02", "strat2",
+                                {"strategy_id": "strat2", "symbols": ["000001"], "count": 1,
+                                 "rows": [], "fields": {}})
+    s1 = store.load_strategies()["strat1"]
+    mk = FakeMarket({"2026-01-02": {"000001": r("000001", 10, 11)}})
+
+    result = run_simulate(store, mk, s1, "2026-01-02")
+
+    assert result["candidates"] == 0
+    assert store.load_accounts()["acc1"].positions == {}
+
+
+def test_run_fetch_reuses_same_query_snapshot_without_api_call(tmp_path, monkeypatch):
+    """当日已有同问句策略的非空快照时, 复用其数据落盘副本并跳过网关调用。"""
+    from datetime import date as _date
+
+    from app.paper import iwencai_service as isvc
+    from app.paper.service import run_fetch
+
+    store = _seed_store(tmp_path)
+    accounts = store.load_accounts()
+    accounts["acc2"] = Account.create("acc2", "账户2", 100000.0)
+    store.save_accounts(accounts)
+    strategies = store.load_strategies()
+    strategies["strat2"] = PaperStrategy.create("strat2", "同问句", "acc2", "query")
+    store.save_strategies(strategies)
+
+    today = _date.today().isoformat()
+    store.save_iwencai_snapshot(today, "strat2",
+                                {"strategy_id": "strat2", "bucket": "daily",
+                                 "symbols": ["000001"], "count": 1, "rows": [],
+                                 "fields": {"000001": {"name": "平安银行"}}})
+
+    def _boom(store, strategy, when=""):
+        raise AssertionError("同问句快照可复用时不应调用网关")
+
+    monkeypatch.setattr(isvc, "fetch_and_persist", _boom)
+
+    s1 = store.load_strategies()["strat1"]
+    out = run_fetch(store, s1, "daily")
+
+    assert out["reused"] is True and out["count"] == 1
+    own = store.load_iwencai_snapshot(today, "strat1")
+    assert own["symbols"] == ["000001"], "应有本策略自己的落盘副本"
+    assert own["strategy_id"] == "strat1" and own["bucket"] == "daily"
 
 
 # ── 卖出: 开盘跌停不卖 / 止损止盈线价 / sell_time=open ──
