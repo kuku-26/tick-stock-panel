@@ -121,6 +121,12 @@ def _fallback_snapshot(store: PaperStore, strategy: PaperStrategy,
 
 
 def _persist_account(store: PaperStore, account: Account) -> None:
-    accounts = store.load_accounts()
-    accounts[account.id] = account
-    store.save_accounts(accounts)
+    """把本策略算好的账户写回 accounts.json。
+
+    必须整段持锁：读-改-写之间若被并发结算/API 写入插队，先读到旧快照再整体
+    覆盖，会把对方刚保存的账户抹掉（多策略同一时刻结算时 dde_02/dde_03 丢失的根因）。
+    """
+    with store.locked():
+        accounts = store.load_accounts()
+        accounts[account.id] = account
+        store.save_accounts(accounts)

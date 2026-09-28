@@ -347,23 +347,23 @@ function StrategyForm({
               {signals.map(s => <option key={s.id} value={s.id}>{s.name} ({s.kind})</option>)}
             </select>
           </Field>
-          <Field label="止损(%)" className="min-w-[130px] flex-1">
-            <input className={inputCls} type="number" step="0.01"
+          <Field label="止损%(填负数)" className="min-w-[130px] flex-1">
+            <input className={inputCls} type="number" step="0.01" max="0"
               value={sellRule.stop_loss_pct ?? ''}
               onChange={e => setDraft({ ...draft, sell_rule: { ...sellRule, stop_loss_pct: e.target.value === '' ? null : Number(e.target.value) } })} />
           </Field>
-          <Field label="止损-前收(%)" className="min-w-[130px] flex-1">
-            <input className={inputCls} type="number" step="0.01"
+          <Field label="止损-前收%(填负数)" className="min-w-[130px] flex-1">
+            <input className={inputCls} type="number" step="0.01" max="0"
               value={sellRule.stop_loss_prev_close_pct ?? ''}
               onChange={e => setDraft({ ...draft, sell_rule: { ...sellRule, stop_loss_prev_close_pct: e.target.value === '' ? null : Number(e.target.value) } })} />
           </Field>
-          <Field label="止盈(%)" className="min-w-[130px] flex-1">
-            <input className={inputCls} type="number" step="0.01"
+          <Field label="止盈%(填正数)" className="min-w-[130px] flex-1">
+            <input className={inputCls} type="number" step="0.01" min="0"
               value={sellRule.take_profit_pct ?? ''}
               onChange={e => setDraft({ ...draft, sell_rule: { ...sellRule, take_profit_pct: e.target.value === '' ? null : Number(e.target.value) } })} />
           </Field>
-          <Field label="止盈-前收(%)" className="min-w-[130px] flex-1">
-            <input className={inputCls} type="number" step="0.01"
+          <Field label="止盈-前收%(填正数)" className="min-w-[130px] flex-1">
+            <input className={inputCls} type="number" step="0.01" min="0"
               value={sellRule.take_profit_prev_close_pct ?? ''}
               onChange={e => setDraft({ ...draft, sell_rule: { ...sellRule, take_profit_prev_close_pct: e.target.value === '' ? null : Number(e.target.value) } })} />
           </Field>

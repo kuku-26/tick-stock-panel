@@ -369,6 +369,25 @@ def test_sell_rule_validation():
         SellRule.from_dict({"max_hold_days": 0})
 
 
+def test_sell_rule_rejects_wrong_sign():
+    """止损必须为负、止盈必须为正。
+
+    线价 = 成本价 × (1 + pct)，符号填反会把线价放到现价另一侧而恒触发：
+    止损填 +0.1 → 线价 成本×1.1，任何低于它的价格都算跌破止损（dde_03 首日误止损的成因）。
+    """
+    with pytest.raises(ValueError, match="必须为负数"):
+        SellRule.from_dict({"stop_loss_pct": 0.1})
+    with pytest.raises(ValueError, match="必须为负数"):
+        SellRule.from_dict({"stop_loss_prev_close_pct": 0.05})
+    with pytest.raises(ValueError, match="必须为正数"):
+        SellRule.from_dict({"take_profit_pct": -0.2})
+    with pytest.raises(ValueError, match="必须为正数"):
+        SellRule.from_dict({"take_profit_prev_close_pct": -0.1})
+    # 合法符号正常通过
+    ok = SellRule.from_dict({"stop_loss_pct": -0.08, "take_profit_pct": 0.3})
+    assert ok.stop_loss_pct == -0.08 and ok.take_profit_pct == 0.3
+
+
 def test_lot_rounding():
     mk = FakeMarket({"2026-01-02": {"000001": r("000001", 10, 10)}})
     acct = make_account()
@@ -1137,3 +1156,64 @@ def test_pending_sell_defers_when_open_limit_down():
     sells = [t for t in trades2 if t.side == "sell"]
     assert len(sells) == 1 and sells[0].price == pytest.approx(9.5)
     assert not acct.positions and not acct.pending_sells
+
+
+# ── 账户/策略落盘并发安全（dde_02/dde_03 账户丢失回归） ──────────
+
+
+def test_load_accounts_raises_on_corrupt_file(tmp_path):
+    """accounts.json 被截断/损坏时必须报错，绝不返回 {}。
+
+    历史 bug：返回空字典后调用方 save_accounts 会把整份文件覆盖成空，
+    并发结算时其他账户被静默抹掉。这里同时断言报错不会进一步改写文件。
+    """
+    store = PaperStore(tmp_path)
+    store.save_accounts({"acc1": Account.create("acc1", "测试账户", 100000.0)})
+    acct_file = tmp_path / "paper" / "accounts.json"
+    acct_file.write_text('{"broken": ', encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        store.load_accounts()
+    assert acct_file.read_text(encoding="utf-8") == '{"broken": '
+
+
+def test_load_strategies_raises_on_corrupt_file(tmp_path):
+    store = PaperStore(tmp_path)
+    store.save_strategies({"s1": PaperStrategy.create("s1", "策略", "acc1", "query")})
+    strat_file = tmp_path / "paper" / "strategies.json"
+    strat_file.write_text("", encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        store.load_strategies()
+
+
+def test_save_accounts_is_atomic(tmp_path):
+    """保存走临时文件 + 原子替换：不残留 .tmp，内容完整可解析。"""
+    store = PaperStore(tmp_path)
+    store.save_accounts({"acc1": Account.create("acc1", "a", 100000.0),
+                         "acc2": Account.create("acc2", "b", 100000.0)})
+    names = [p.name for p in (tmp_path / "paper").iterdir()]
+    assert "accounts.json" in names
+    assert not any(n.endswith(".tmp") for n in names)
+    assert set(store.load_accounts()) == {"acc1", "acc2"}
+
+
+def test_concurrent_persist_account_keeps_all(tmp_path):
+    """三个线程反复并发落盘各自账户（模拟多策略同一时刻结算）后三个都在。"""
+    import threading
+
+    from app.paper.service import _persist_account
+
+    store = PaperStore(tmp_path)
+    store.save_accounts({})
+    accs = [Account.create(f"acc{i}", f"账户{i}", 100000.0) for i in range(3)]
+
+    def worker(acc: Account) -> None:
+        for _ in range(30):
+            _persist_account(store, acc)
+
+    threads = [threading.Thread(target=worker, args=(a,)) for a in accs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert set(store.load_accounts()) == {"acc0", "acc1", "acc2"}

@@ -111,53 +111,55 @@ def create_account(req: AccountModel, request: Request):
     validate_id(req.id, "账户id")
     if req.initial_cash <= 0:
         raise HTTPException(status_code=400, detail="initial_cash 必须大于 0")
-    accounts = store.load_accounts()
-    if req.id in accounts:
-        raise HTTPException(status_code=400, detail="账户 id 已存在")
-    accounts[req.id] = Account.create(req.id, req.name, req.initial_cash)
-    store.save_accounts(accounts)
-    return {"ok": True, "account": accounts[req.id].to_dict()}
+    # 读-改-写整段持锁，避免与并发结算互相覆盖（见 store.locked 文档）
+    with store.locked():
+        accounts = store.load_accounts()
+        if req.id in accounts:
+            raise HTTPException(status_code=400, detail="账户 id 已存在")
+        accounts[req.id] = Account.create(req.id, req.name, req.initial_cash)
+        store.save_accounts(accounts)
+        created = accounts[req.id].to_dict()
+    return {"ok": True, "account": created}
 
 
 @router.delete("/accounts/{account_id}")
 def delete_account(account_id: str, request: Request):
     store = _store(request)
-    accounts = store.load_accounts()
-    if account_id not in accounts:
-        raise HTTPException(status_code=404, detail="账户不存在")
-    # 校验：仍有策略绑定时禁止删除
-    for s in store.load_strategies().values():
-        if s.account_id == account_id:
-            raise HTTPException(status_code=400,
-                                detail=f"账户仍被策略「{s.name}」绑定，请先删除/改绑策略")
-    del accounts[account_id]
-    store.save_accounts(accounts)
+    with store.locked():
+        accounts = store.load_accounts()
+        if account_id not in accounts:
+            raise HTTPException(status_code=404, detail="账户不存在")
+        # 校验：仍有策略绑定时禁止删除
+        for s in store.load_strategies().values():
+            if s.account_id == account_id:
+                raise HTTPException(status_code=400,
+                                    detail=f"账户仍被策略「{s.name}」绑定，请先删除/改绑策略")
+        del accounts[account_id]
+        store.save_accounts(accounts)
     return {"ok": True}
 
 
 @router.put("/accounts/{account_id}")
 def update_account(account_id: str, req: AccountUpdateModel, request: Request):
     store = _store(request)
-    accounts = store.load_accounts()
-    if account_id not in accounts:
-        raise HTTPException(status_code=404, detail="账户不存在")
     if req.initial_cash <= 0:
         raise HTTPException(status_code=400, detail="initial_cash 必须大于 0")
-    acc = accounts[account_id]
-    acc.name = req.name.strip()
-    acc.initial_cash = req.initial_cash
-    store.save_accounts(accounts)
-    return {"ok": True, "account": acc.to_dict()}
+    with store.locked():
+        accounts = store.load_accounts()
+        if account_id not in accounts:
+            raise HTTPException(status_code=404, detail="账户不存在")
+        acc = accounts[account_id]
+        acc.name = req.name.strip()
+        acc.initial_cash = req.initial_cash
+        store.save_accounts(accounts)
+        updated = acc.to_dict()
+    return {"ok": True, "account": updated}
 
 
 @router.post("/accounts/{account_id}/trade")
 def manual_trade(account_id: str, req: ManualTradeModel, request: Request):
     """手动新增/平仓一笔交易：直接改账户现金与持仓，并追加一条"manual"成交流水。"""
     store = _store(request)
-    accounts = store.load_accounts()
-    if account_id not in accounts:
-        raise HTTPException(status_code=404, detail="账户不存在")
-    acc = accounts[account_id]
     symbol = req.symbol.strip()
     if not symbol:
         raise HTTPException(status_code=400, detail="股票代码不能为空")
@@ -169,40 +171,46 @@ def manual_trade(account_id: str, req: ManualTradeModel, request: Request):
         raise HTTPException(status_code=400, detail="价格必须大于 0")
     date = req.date.strip() or _date.today().isoformat()
 
-    # 绑定策略（流水归属 + 已结算快照日期来源）
-    bound = next((s for s in store.load_strategies().values()
-                  if s.account_id == account_id), None)
+    with store.locked():
+        accounts = store.load_accounts()
+        if account_id not in accounts:
+            raise HTTPException(status_code=404, detail="账户不存在")
+        acc = accounts[account_id]
+        # 绑定策略（流水归属 + 已结算快照日期来源）
+        bound = next((s for s in store.load_strategies().values()
+                      if s.account_id == account_id), None)
 
-    if req.side == "buy":
-        cost = req.qty * req.price
-        if acc.cash + 1e-9 < cost:
-            raise HTTPException(status_code=400,
-                                detail=f"可用资金不足（需 {cost:.2f}，当前 {acc.cash:.2f}）")
-        acc.cash -= cost
-        if symbol in acc.positions:
-            pos = acc.positions[symbol]
-            tq = pos.qty + req.qty
-            pos.avg_cost = (pos.avg_cost * pos.qty + cost) / tq
-            pos.qty = tq
+        if req.side == "buy":
+            cost = req.qty * req.price
+            if acc.cash + 1e-9 < cost:
+                raise HTTPException(status_code=400,
+                                    detail=f"可用资金不足（需 {cost:.2f}，当前 {acc.cash:.2f}）")
+            acc.cash -= cost
+            if symbol in acc.positions:
+                pos = acc.positions[symbol]
+                tq = pos.qty + req.qty
+                pos.avg_cost = (pos.avg_cost * pos.qty + cost) / tq
+                pos.qty = tq
+            else:
+                pos = Position(symbol, req.qty, req.price, date)
+                # 手动补录历史日期的买入视同该日建仓：按已结算快照重算持有天数
+                # （与引擎/删除回放同口径），否则 max_hold 判定会晚一个交易日
+                if bound is not None:
+                    pos.hold_days = hold_days_since(date, store.list_day_dates(bound.id),
+                                                    acc.last_record_date)
+                acc.positions[symbol] = pos
         else:
-            pos = Position(symbol, req.qty, req.price, date)
-            # 手动补录历史日期的买入视同该日建仓：按已结算快照重算持有天数
-            # （与引擎/删除回放同口径），否则 max_hold 判定会晚一个交易日
-            if bound is not None:
-                pos.hold_days = hold_days_since(date, store.list_day_dates(bound.id),
-                                                acc.last_record_date)
-            acc.positions[symbol] = pos
-    else:
-        pos = acc.positions.get(symbol)
-        if pos is None or pos.qty < req.qty:
-            have = pos.qty if pos else 0
-            raise HTTPException(status_code=400,
-                                detail=f"持仓不足（当前 {have} 股，需 {req.qty} 股）")
-        acc.cash += req.qty * req.price
-        pos.qty -= req.qty
-        if pos.qty == 0:
-            del acc.positions[symbol]
-    store.save_accounts(accounts)
+            pos = acc.positions.get(symbol)
+            if pos is None or pos.qty < req.qty:
+                have = pos.qty if pos else 0
+                raise HTTPException(status_code=400,
+                                    detail=f"持仓不足（当前 {have} 股，需 {req.qty} 股）")
+            acc.cash += req.qty * req.price
+            pos.qty -= req.qty
+            if pos.qty == 0:
+                del acc.positions[symbol]
+        store.save_accounts(accounts)
+        account_dict = acc.to_dict()
 
     # 追加一条人工成交到绑定策略的流水（保证列表可见、级联删除一致）
     if bound is not None:
@@ -210,7 +218,7 @@ def manual_trade(account_id: str, req: ManualTradeModel, request: Request):
                          req.side, req.qty, req.price,
                          round(req.qty * req.price, 2), "manual")
         store.append_trades(bound.id, [tr])
-    return {"ok": True, "account": acc.to_dict()}
+    return {"ok": True, "account": account_dict}
 
 
 @router.delete("/accounts/{account_id}/trades/{trade_id}")
@@ -222,31 +230,33 @@ def delete_trade(account_id: str, trade_id: str, request: Request):
     （净值曲线）不改写，后续结算按新状态落盘。
     """
     store = _store(request)
-    accounts = store.load_accounts()
-    if account_id not in accounts:
-        raise HTTPException(status_code=404, detail="账户不存在")
-    strategies = store.load_strategies()
-    bound = next((s for s in strategies.values() if s.account_id == account_id), None)
-    if bound is None:
-        raise HTTPException(status_code=400, detail="该账户未绑定策略，无法定位流水")
-    trades = store.load_trades(bound.id)
-    target = next((t for t in trades if t.get("id") == trade_id), None)
-    if target is None:
-        raise HTTPException(status_code=404, detail="交易记录不存在")
-    if target.get("account_id") != account_id:
-        raise HTTPException(status_code=400, detail="交易不属于该账户")
-    remaining = [t for t in trades if t.get("id") != trade_id]
+    with store.locked():
+        accounts = store.load_accounts()
+        if account_id not in accounts:
+            raise HTTPException(status_code=404, detail="账户不存在")
+        strategies = store.load_strategies()
+        bound = next((s for s in strategies.values() if s.account_id == account_id), None)
+        if bound is None:
+            raise HTTPException(status_code=400, detail="该账户未绑定策略，无法定位流水")
+        trades = store.load_trades(bound.id)
+        target = next((t for t in trades if t.get("id") == trade_id), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail="交易记录不存在")
+        if target.get("account_id") != account_id:
+            raise HTTPException(status_code=400, detail="交易不属于该账户")
+        remaining = [t for t in trades if t.get("id") != trade_id]
 
-    acc = accounts[account_id]
-    # 回放重建现金/持仓，并按该策略已结算快照日期重算各持仓 hold_days
-    # （回放无法从流水推导持有天数，见 trading.replay_account 文档）
-    replay_account(acc, remaining, store.list_day_dates(bound.id))
-    store.rewrite_trades(bound.id, remaining)
-    store.save_accounts(accounts)
+        acc = accounts[account_id]
+        # 回放重建现金/持仓，并按该策略已结算快照日期重算各持仓 hold_days
+        # （回放无法从流水推导持有天数，见 trading.replay_account 文档）
+        replay_account(acc, remaining, store.list_day_dates(bound.id))
+        store.rewrite_trades(bound.id, remaining)
+        store.save_accounts(accounts)
+        account_dict = acc.to_dict()
     logger.info("paper delete trade %s (account %s): replayed %d trades",
                 trade_id, account_id, len(remaining))
     return {"ok": True, "deleted": trade_id, "trades": len(remaining),
-            "account": acc.to_dict()}
+            "account": account_dict}
 
 
 # ── 策略 ────────────────────────────────────────────────
@@ -334,74 +344,79 @@ def create_strategy(req: StrategyModel, request: Request):
     validate_id(req.id, "策略id")
     if not req.iwencai_query.strip():
         raise HTTPException(status_code=400, detail="iwencai_query 不能为空")
-    accounts = store.load_accounts()
-    if req.account_id not in accounts:
-        raise HTTPException(status_code=400, detail="绑定的账户不存在")
-    strategies = store.load_strategies()
-    if req.id in strategies:
-        raise HTTPException(status_code=400, detail="策略 id 已存在")
-    if _account_bound_to_other(strategies, req.account_id, req.id):
-        raise HTTPException(status_code=400, detail="该账户已被其它策略卡片绑定（一对一）")
     try:
         buy = BuyRule.from_dict(req.buy_rule)
         sell = SellRule.from_dict(req.sell_rule)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     _validate_limit_open_settle_time(buy, sell, req.simulate_time)
-    strategy = PaperStrategy.create(req.id, req.name, req.account_id,
-                                    req.iwencai_query.strip(), req.api_key.strip())
-    strategy.enabled = req.enabled
-    strategy.buy_rule = buy
-    strategy.sell_rule = sell
-    strategy.fetch_time = req.fetch_time
-    strategy.simulate_time = req.simulate_time
-    strategies[req.id] = strategy
-    store.save_strategies(strategies)
+    with store.locked():
+        accounts = store.load_accounts()
+        if req.account_id not in accounts:
+            raise HTTPException(status_code=400, detail="绑定的账户不存在")
+        strategies = store.load_strategies()
+        if req.id in strategies:
+            raise HTTPException(status_code=400, detail="策略 id 已存在")
+        if _account_bound_to_other(strategies, req.account_id, req.id):
+            raise HTTPException(status_code=400, detail="该账户已被其它策略卡片绑定（一对一）")
+        strategy = PaperStrategy.create(req.id, req.name, req.account_id,
+                                        req.iwencai_query.strip(), req.api_key.strip())
+        strategy.enabled = req.enabled
+        strategy.buy_rule = buy
+        strategy.sell_rule = sell
+        strategy.fetch_time = req.fetch_time
+        strategy.simulate_time = req.simulate_time
+        strategies[req.id] = strategy
+        store.save_strategies(strategies)
+        strategy_dict = strategy.to_dict()
     _reload_scheduler(request)
-    return {"ok": True, "strategy": strategy.to_dict()}
+    return {"ok": True, "strategy": strategy_dict}
 
 
 @router.put("/strategies/{strategy_id}")
 def update_strategy(strategy_id: str, req: StrategyModel, request: Request):
     store = _store(request)
-    strategies = store.load_strategies()
-    if strategy_id not in strategies:
-        raise HTTPException(status_code=404, detail="策略不存在")
-    accounts = store.load_accounts()
-    if req.account_id not in accounts:
-        raise HTTPException(status_code=400, detail="绑定的账户不存在")
-    if _account_bound_to_other(strategies, req.account_id, strategy_id):
-        raise HTTPException(status_code=400, detail="该账户已被其它策略卡片绑定（一对一）")
     try:
         buy = BuyRule.from_dict(req.buy_rule)
         sell = SellRule.from_dict(req.sell_rule)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     _validate_limit_open_settle_time(buy, sell, req.simulate_time)
-    s = strategies[strategy_id]
-    s.name = req.name
-    s.account_id = req.account_id
-    s.iwencai_query = req.iwencai_query.strip()
-    s.api_key = req.api_key.strip()
-    s.enabled = req.enabled
-    s.buy_rule = buy
-    s.sell_rule = sell
-    s.fetch_time = req.fetch_time
-    s.simulate_time = req.simulate_time
-    store.save_strategies(strategies)
+    with store.locked():
+        strategies = store.load_strategies()
+        if strategy_id not in strategies:
+            raise HTTPException(status_code=404, detail="策略不存在")
+        accounts = store.load_accounts()
+        if req.account_id not in accounts:
+            raise HTTPException(status_code=400, detail="绑定的账户不存在")
+        if _account_bound_to_other(strategies, req.account_id, strategy_id):
+            raise HTTPException(status_code=400, detail="该账户已被其它策略卡片绑定（一对一）")
+        s = strategies[strategy_id]
+        s.name = req.name
+        s.account_id = req.account_id
+        s.iwencai_query = req.iwencai_query.strip()
+        s.api_key = req.api_key.strip()
+        s.enabled = req.enabled
+        s.buy_rule = buy
+        s.sell_rule = sell
+        s.fetch_time = req.fetch_time
+        s.simulate_time = req.simulate_time
+        store.save_strategies(strategies)
+        strategy_dict = s.to_dict()
     _reload_scheduler(request)
-    return {"ok": True, "strategy": s.to_dict()}
+    return {"ok": True, "strategy": strategy_dict}
 
 
 @router.delete("/strategies/{strategy_id}")
 def delete_strategy(strategy_id: str, request: Request):
     store = _store(request)
-    strategies = store.load_strategies()
-    if strategy_id not in strategies:
-        raise HTTPException(status_code=404, detail="策略不存在")
-    del strategies[strategy_id]
-    store.save_strategies(strategies)
-    store.delete_strategy_data(strategy_id)  # 级联清理该卡片的问财快照/日快照/成交
+    with store.locked():
+        strategies = store.load_strategies()
+        if strategy_id not in strategies:
+            raise HTTPException(status_code=404, detail="策略不存在")
+        del strategies[strategy_id]
+        store.save_strategies(strategies)
+        store.delete_strategy_data(strategy_id)  # 级联清理该卡片的问财快照/日快照/成交
     _reload_scheduler(request)
     return {"ok": True}
 

@@ -176,13 +176,22 @@ class SellRule:
         if not isinstance(sigs, list) or not all(isinstance(s, str) for s in sigs):
             raise ValueError("exit_signal_ids 必须是字符串列表")
 
-        def _ratio(key: str) -> float | None:
+        def _ratio(key: str, sign: int) -> float | None:
+            """sign=+1 止盈（须为正）、-1 止损（须为负）。
+
+            止损/止盈线价 = 成本价 × (1 + pct)，符号填反会把线价放到现价另一侧：
+            例如止损填 +0.1 得到"成本×1.1"，任何低于它的价格都算跌破止损，恒触发。
+            """
             v = d.get(key)
             if v is None or v == "":
                 return None
             v = float(v)
             if not (-1 < v < 100):
                 raise ValueError(f"{key} 必须在 (-1,100) 区间（小数制）")
+            if sign > 0 and v <= 0:
+                raise ValueError(f"{key} 必须为正数（小数制），如 0.2 表示盈利 20% 止盈")
+            if sign < 0 and v >= 0:
+                raise ValueError(f"{key} 必须为负数（小数制），如 -0.05 表示亏损 5% 止损")
             return v
 
         hold = d.get("max_hold_days")
@@ -193,10 +202,10 @@ class SellRule:
         if stime not in ("close", "open", "next_open"):
             raise ValueError("sell_time 只能是 close / open / next_open")
         return cls(exit_signal_ids=list(sigs),
-                   stop_loss_pct=_ratio("stop_loss_pct"),
-                   stop_loss_prev_close_pct=_ratio("stop_loss_prev_close_pct"),
-                   take_profit_pct=_ratio("take_profit_pct"),
-                   take_profit_prev_close_pct=_ratio("take_profit_prev_close_pct"),
+                   stop_loss_pct=_ratio("stop_loss_pct", -1),
+                   stop_loss_prev_close_pct=_ratio("stop_loss_prev_close_pct", -1),
+                   take_profit_pct=_ratio("take_profit_pct", 1),
+                   take_profit_prev_close_pct=_ratio("take_profit_prev_close_pct", 1),
                    max_hold_days=hold,
                    sell_time=stime,
                    sell_limit_down_open=bool(d.get("sell_limit_down_open", False)))

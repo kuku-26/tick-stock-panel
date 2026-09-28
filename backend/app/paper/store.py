@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +30,28 @@ class PaperStore:
         self._snap = self.root / "iwencai_snapshot"
         self._days = self.root / "days"
         self._trades = self.root / "trades"
+        # 保护 accounts/strategies 的"读-改-写"整体原子性：多个策略同一时刻结算
+        # （scheduler 线程池）或结算与 API 写操作并发时，避免互相覆盖丢账户。
+        self._lock = threading.Lock()
+
+    @contextmanager
+    def locked(self) -> Iterator[None]:
+        """串行化账户/策略的读-改-写。调用方需自行把 load→改→save 整段包进来。
+
+        只提供普通 Lock（不可重入）：持锁期间不要再次进入 `locked()`，
+        也不要调用会自行加锁的 `_persist_account`。
+        """
+        with self._lock:
+            yield
+
+    @staticmethod
+    def _atomic_write(path: Path, text: str) -> None:
+        """临时文件 + os.replace 原子落盘：任何时刻读到的要么是旧内容要么是新内容，
+        不会出现被截断的半截 JSON（并发读拿不到内容就会误判为空）。"""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
 
     # ── 账户 ────────────────────────────────────────────
     def load_accounts(self) -> dict[str, Account]:
@@ -34,8 +60,10 @@ class PaperStore:
         try:
             raw = json.loads(self._acct.read_text(encoding="utf-8"))
         except Exception as e:
-            logger.warning("accounts load failed: %s", e)
-            return {}
+            # 绝不静默返回 {}：调用方随后 save_accounts 会用这个空字典覆盖整份
+            # accounts.json，把其他账户一并抹掉（历史上 dde_02/dde_03 丢失的根因）。
+            logger.error("accounts load failed: %s", e)
+            raise RuntimeError(f"accounts.json 解析失败，已拒绝按空数据继续: {e}") from e
         out: dict[str, Account] = {}
         for a in raw if isinstance(raw, list) else []:
             if isinstance(a, dict):
@@ -48,10 +76,10 @@ class PaperStore:
         return out
 
     def save_accounts(self, accounts: dict[str, Account]) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        self._acct.write_text(
+        self._atomic_write(
+            self._acct,
             json.dumps([a.to_dict() for a in accounts.values()],
-                       ensure_ascii=False, indent=2), encoding="utf-8")
+                       ensure_ascii=False, indent=2))
 
     # ── 策略 ────────────────────────────────────────────
     def load_strategies(self) -> dict[str, PaperStrategy]:
@@ -60,8 +88,9 @@ class PaperStore:
         try:
             raw = json.loads(self._strat.read_text(encoding="utf-8"))
         except Exception as e:
-            logger.warning("strategies load failed: %s", e)
-            return {}
+            # 同 load_accounts：不得返回 {}，否则调用方保存时会把全部策略覆盖掉。
+            logger.error("strategies load failed: %s", e)
+            raise RuntimeError(f"strategies.json 解析失败，已拒绝按空数据继续: {e}") from e
         out: dict[str, PaperStrategy] = {}
         for s in raw if isinstance(raw, list) else []:
             if isinstance(s, dict):
@@ -93,10 +122,10 @@ class PaperStore:
             self.save_strategies(strategies)
 
     def save_strategies(self, strategies: dict[str, PaperStrategy]) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        self._strat.write_text(
+        self._atomic_write(
+            self._strat,
             json.dumps([s.to_dict() for s in strategies.values()],
-                       ensure_ascii=False, indent=2), encoding="utf-8")
+                       ensure_ascii=False, indent=2))
 
     # ── 每日问财选股快照 ────────────────────────────────
     def snapshot_dir(self, d: str) -> Path:
