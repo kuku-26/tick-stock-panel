@@ -203,7 +203,7 @@ def _sell_positions(market: MarketData, account: Account, strategy: PaperStrateg
                 if (rule.sell_limit_down_open and row is not None) else None
             if fill is None:
                 if row is not None:
-                    logger.info("paper sell skip %s: 开盘跌停/停牌，当日不可卖", symbol)
+                    logger.info("wencai sell skip %s: 开盘跌停/停牌，当日不可卖", symbol)
                 continue
             price = fill
         else:
@@ -233,7 +233,7 @@ def _fill_pending_sells(market: MarketData, account: Account,
         row = rows.get(ps.symbol)
         if not market.sellable_at_open(ps.symbol, row):
             if row is not None:
-                logger.info("paper pending sell defer %s: 开盘跌停/停牌，顺延", ps.symbol)
+                logger.info("wencai pending sell defer %s: 开盘跌停/停牌，顺延", ps.symbol)
             remaining.append(ps)
             continue
         price = row.open if (row.open is not None and row.open > 0) else row.close
@@ -354,7 +354,7 @@ def _generate_buys(account: Account, strategy: PaperStrategy, candidates: list[s
             fill = market.limit_up_open_buy_price(sym, rows[sym]) \
                 if rule.buy_limit_up_open else None
             if fill is None:
-                logger.info("paper buy skip %s: 当日开盘不可买(一字板/涨停/停牌)", sym)
+                logger.info("wencai buy skip %s: 当日开盘不可买(一字板/涨停/停牌)", sym)
                 continue
             price = fill
         budget = min(per_budget, account.cash, total_budget)

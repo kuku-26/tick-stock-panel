@@ -1,5 +1,5 @@
 // 问财实盘模拟 — 局部 API 客户端（自包含新模块，不写入核心 api.ts）
-// 后端路由见 backend/app/paper/api.py (/api/paper/*)
+// 后端路由见 backend/app/wencai/api.py (/api/wencai/*)
 
 export interface Position {
   symbol: string
@@ -194,7 +194,7 @@ export interface SettleResult {
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api/paper${path}`, {
+  const res = await fetch(`/api/wencai${path}`, {
     headers: init?.method && init.method !== 'GET' ? { 'Content-Type': 'application/json' } : {},
     ...init,
   })

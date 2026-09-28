@@ -35,7 +35,7 @@ _ALL_OPS = _NUMERIC_OPS | _GENERAL_OPS | _STRING_OPS
 
 @dataclass
 class FieldFilter:
-    """对问财返回归一化字段的单条件。field 见 app.paper.fields.IWENCAI_FIELD_CATALOG。"""
+    """对问财返回归一化字段的单条件。field 见 app.wencai.fields.IWENCAI_FIELD_CATALOG。"""
 
     field: str
     op: str            # > >= < <= == != contains not_contains

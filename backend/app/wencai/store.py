@@ -1,6 +1,6 @@
 """文件持久化：账户 / 策略 / 每日问财快照 / 每日账户快照 / 逐笔成交。
 
-目录布局（data/paper/）：
+目录布局（data/wencai/）：
   accounts.json / strategies.json
   iwencai_snapshot/<date>/<strategy_id>.json
   days/<date>/<strategy_id>.json
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 class PaperStore:
     def __init__(self, data_dir: Path):
-        self.root = data_dir / "paper"
+        self.root = data_dir / "wencai"
         self._acct = self.root / "accounts.json"
         self._strat = self.root / "strategies.json"
         self._snap = self.root / "iwencai_snapshot"
@@ -237,4 +237,4 @@ class PaperStore:
             trades_file.unlink()
             removed += 1
         if removed:
-            logger.info("paper delete strategy data %s: removed %d files", strategy_id, removed)
+            logger.info("wencai delete strategy data %s: removed %d files", strategy_id, removed)

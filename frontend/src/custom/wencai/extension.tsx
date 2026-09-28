@@ -1245,11 +1245,11 @@ function PaperPage() {
 }
 
 const extension: FrontendExtension = {
-  id: 'paper.trading',
+  id: 'wencai.trading',
   apiVersion: 1,
-  routes: [{ id: 'paper-trading', path: '/paper', component: PaperPage }],
+  routes: [{ id: 'wencai-trading', path: '/wencai', component: PaperPage }],
   navigation: [
-    { id: 'paper-trading', routeId: 'paper-trading', label: '问财实盘模拟', icon: LineChart, order: 800 },
+    { id: 'wencai-trading', routeId: 'wencai-trading', label: '问财实盘模拟', icon: LineChart, order: 800 },
   ],
 }
 

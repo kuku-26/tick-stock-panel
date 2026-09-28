@@ -31,12 +31,12 @@ def _fetch(strategy_id: str) -> None:
         store = context.get_store()
         strategy = store.load_strategies().get(strategy_id)
         if strategy is None or not strategy.enabled:
-            logger.info("paper fetch %s: 策略不存在或未启用, 跳过", strategy_id)
+            logger.info("wencai fetch %s: 策略不存在或未启用, 跳过", strategy_id)
             return
         result = run_fetch(store, strategy, when="daily")
-        logger.info("paper fetch %s: 命中 %d", strategy_id, result.get("count", 0))
+        logger.info("wencai fetch %s: 命中 %d", strategy_id, result.get("count", 0))
     except Exception as e:
-        logger.exception("paper fetch %s failed: %s", strategy_id, e)
+        logger.exception("wencai fetch %s failed: %s", strategy_id, e)
 
 
 def _simulate(strategy_id: str, date_str: str | None = None) -> None:
@@ -45,15 +45,15 @@ def _simulate(strategy_id: str, date_str: str | None = None) -> None:
         store = context.get_store()
         strategy = store.load_strategies().get(strategy_id)
         if strategy is None or not strategy.enabled:
-            logger.info("paper simulate %s: 策略不存在或未启用, 跳过", strategy_id)
+            logger.info("wencai simulate %s: 策略不存在或未启用, 跳过", strategy_id)
             return
         result = run_simulate(store, context.get_market(), strategy, date_str)
-        logger.info("paper simulate %s: %s", strategy_id, result)
+        logger.info("wencai simulate %s: %s", strategy_id, result)
     except MarketDataNotReadyError as e:
-        logger.warning("paper simulate %s: 行情数据未就绪, 本次结算跳过: %s",
+        logger.warning("wencai simulate %s: 行情数据未就绪, 本次结算跳过: %s",
                        strategy_id, e)
     except Exception as e:
-        logger.exception("paper simulate %s failed: %s", strategy_id, e)
+        logger.exception("wencai simulate %s failed: %s", strategy_id, e)
 
 
 class PaperScheduler:
@@ -68,7 +68,7 @@ class PaperScheduler:
         self._schedule_all()
         if not self._sched.running:
             self._sched.start()
-        logger.info("paper scheduler started: %d strategies",
+        logger.info("wencai scheduler started: %d strategies",
                     len(self._store.load_strategies()))
 
     def reload(self) -> None:
@@ -80,14 +80,14 @@ class PaperScheduler:
     def stop(self) -> None:
         if self._sched.running:
             self._sched.shutdown(wait=False)
-        logger.info("paper scheduler stopped")
+        logger.info("wencai scheduler stopped")
 
     # ── 内部 ────────────────────────────────────────────
     def _schedule_all(self) -> None:
         strategies = self._store.load_strategies()
-        # 移除旧的 paper_* cron job 后按当前策略重注册(幂等)。
+        # 移除旧的 wencai_* cron job 后按当前策略重注册(幂等)。
         for job in self._sched.get_jobs():
-            if job.id.startswith("paper_"):
+            if job.id.startswith("wencai_"):
                 try:
                     self._sched.remove_job(job.id)
                 except Exception:
@@ -100,13 +100,13 @@ class PaperScheduler:
             self._sched.add_job(
                 _fetch, trigger=CronTrigger(day_of_week="mon-fri", hour=fh, minute=fm,
                                             timezone=TZ),
-                id=f"paper_fetch_{sid}", misfire_grace_time=1800,
+                id=f"wencai_fetch_{sid}", misfire_grace_time=1800,
                 args=[sid], replace_existing=True,
             )
             self._sched.add_job(
                 _simulate, trigger=CronTrigger(day_of_week="mon-fri", hour=sh, minute=sm,
                                                timezone=TZ),
-                id=f"paper_sim_{sid}", misfire_grace_time=3600,
+                id=f"wencai_sim_{sid}", misfire_grace_time=3600,
                 args=[sid], replace_existing=True,
             )
 

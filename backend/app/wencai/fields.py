@@ -1,7 +1,7 @@
 """问财返回字段的归一化与条件判定。
 
 问财列名常带日期后缀（如 ``dde大单净量[20260904]``、``涨跌幅[20260824-20260904]``），
-这里按列名前缀解析为稳定 key，供买入条件（app.paper.models.FieldFilter）引用。
+这里按列名前缀解析为稳定 key，供买入条件（app.wencai.models.FieldFilter）引用。
 """
 from __future__ import annotations
 

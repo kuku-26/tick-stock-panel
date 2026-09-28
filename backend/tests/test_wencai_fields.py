@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from app.paper.fields import (evaluate_filter, evaluate_filters, normalize_row,
+from app.wencai.fields import (evaluate_filter, evaluate_filters, normalize_row,
                               normalize_rows)
-from app.paper.market import DayRow
-from app.paper.models import FieldFilter
-from app.paper.store import PaperStore
-from app.paper.trading import process_day
+from app.wencai.market import DayRow
+from app.wencai.models import FieldFilter
+from app.wencai.store import PaperStore
+from app.wencai.trading import process_day
 
 # ── 样例原始列（近似用户提供的问财返回） ─────────────────
 
@@ -121,12 +121,12 @@ class FakeMarket:
 
 
 def make_acct():
-    from app.paper.models import Account
+    from app.wencai.models import Account
     return Account.create("acc1", "测试", 100000)
 
 
 def make_strategy(filters=None, signals=None):
-    from app.paper.models import PaperStrategy
+    from app.wencai.models import PaperStrategy
     s = PaperStrategy.create("strat1", "策略", "acc1", "query")
     s.buy_rule.iwencai_filters = [FieldFilter.from_dict(x) for x in (filters or [])]
     s.buy_rule.signal_ids = list(signals or [])
@@ -178,7 +178,7 @@ def test_buy_signal_and_field_or_any_source_passes():
 
 
 def test_available_fields_derived_from_records():
-    from app.paper.fields import available_fields
+    from app.wencai.fields import available_fields
     flds = available_fields([sample_raw(),
                              {**sample_raw(), "股票代码": "000001.SZ",
                               "股票简称": "平安银行", "dde大单净量[20260904]": -1.2,
@@ -192,7 +192,7 @@ def test_available_fields_derived_from_records():
 
 
 def test_fields_from_normalized_uses_raw_label():
-    from app.paper.fields import fields_from_normalized
+    from app.wencai.fields import fields_from_normalized
     fm = {"000560": {"dde_net": 9.7}, "000001": {"dde_net": -1.2}}
     raw = {"000560": {"dde大单净量[20260904]": 9.7, "trade": 1}}
     flds = fields_from_normalized(fm, raw)
@@ -205,9 +205,9 @@ def test_fields_from_normalized_uses_raw_label():
 def test_signal_options_merges_snapshot_fields(tmp_path):
     from types import SimpleNamespace
 
-    from app.paper import context as pc
-    from app.paper.api import signal_options
-    from app.paper.models import Account, PaperStrategy
+    from app.wencai import context as pc
+    from app.wencai.api import signal_options
+    from app.wencai.models import Account, PaperStrategy
 
     store = PaperStore(tmp_path / "data")
     store.save_accounts({"acc1": Account.create("acc1", "测试", 100000)})
@@ -230,9 +230,9 @@ def test_signal_options_merges_snapshot_fields(tmp_path):
 def test_account_detail_resolves_bound_strategy(tmp_path):
     from types import SimpleNamespace
 
-    from app.paper import context as pc
-    from app.paper.api import account_detail
-    from app.paper.models import (Account, DaySnapshot, PaperStrategy, Position,
+    from app.wencai import context as pc
+    from app.wencai.api import account_detail
+    from app.wencai.models import (Account, DaySnapshot, PaperStrategy, Position,
                                   TradeRecord)
 
     store = PaperStore(tmp_path / "data")
@@ -263,9 +263,9 @@ def test_account_detail_resolves_bound_strategy(tmp_path):
 def test_account_detail_no_bound_is_empty(tmp_path):
     from types import SimpleNamespace
 
-    from app.paper import context as pc
-    from app.paper.api import account_detail
-    from app.paper.models import Account
+    from app.wencai import context as pc
+    from app.wencai.api import account_detail
+    from app.wencai.models import Account
 
     store = PaperStore(tmp_path / "data")
     store.save_accounts({"acc2": Account.create("acc2", "无绑定", 100000)})
@@ -282,7 +282,7 @@ def test_account_detail_no_bound_is_empty(tmp_path):
 
 
 def test_accounts_and_strategies_roundtrip(tmp_path):
-    from app.paper.models import Account, PaperStrategy
+    from app.wencai.models import Account, PaperStrategy
     store = PaperStore(tmp_path / "data")
     acct = Account.create("acc1", "测试", 100000)
     strat = PaperStrategy.create("strat1", "策略", "acc1", "query")
@@ -304,7 +304,7 @@ def test_delete_strategy_data_cascades(tmp_path):
     store.save_iwencai_snapshot("2026-01-02", "strat1", {"symbols": ["000001"]})
     store.save_iwencai_snapshot("2026-01-03", "strat1", {"symbols": ["000002"]})
     store.save_iwencai_snapshot("2026-01-04", "strat2", {"symbols": ["000003"]})
-    from app.paper.models import DaySnapshot, Position
+    from app.wencai.models import DaySnapshot, Position
     snap = DaySnapshot("acc1", "strat1", "2026-01-02", 10000.0,
                        {"000001": Position("000001", 100, 10, "2026-01-02")}, 1000.0, 11000.0, 1.1)
     store.save_day(snap)

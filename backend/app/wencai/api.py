@@ -1,7 +1,7 @@
 """问财实盘模拟 API 路由：账户 / 策略 CRUD + 手动触发 + 查询。
 
-挂载到 /api/paper/*，通过 app.state.paper_store / paper_market / paper_scheduler
-访问共享实例（由 backend/app/custom/paper.py 在启动时注入）。
+挂载到 /api/wencai/*，通过 app.state.wencai_store / wencai_market / wencai_scheduler
+访问共享实例（由 backend/app/custom/wencai.py 在启动时注入）。
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from .trading import attach_trade_pnl, hold_days_since, replay_account
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/paper", tags=["paper"])
+router = APIRouter(prefix="/api/wencai", tags=["wencai"])
 
 
 def _store(request: Request):
@@ -253,7 +253,7 @@ def delete_trade(account_id: str, trade_id: str, request: Request):
         store.rewrite_trades(bound.id, remaining)
         store.save_accounts(accounts)
         account_dict = acc.to_dict()
-    logger.info("paper delete trade %s (account %s): replayed %d trades",
+    logger.info("wencai delete trade %s (account %s): replayed %d trades",
                 trade_id, account_id, len(remaining))
     return {"ok": True, "deleted": trade_id, "trades": len(remaining),
             "account": account_dict}
@@ -284,7 +284,7 @@ def signal_options(request: Request, strategy_id: str | None = None):
     """
     from app.strategy import custom_signals
     store = _store(request)
-    data_dir = store.root.parent  # data/paper -> data
+    data_dir = store.root.parent  # data/wencai -> data
     sigs = custom_signals.load_all(data_dir)
     fields: list[dict] = ([{"key": k, "label": label, "type": typ}
                            for k, label, typ in IWENCAI_FIELD_CATALOG])
@@ -459,7 +459,7 @@ def settle_now(strategy_id: str, request: Request):
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"结算失败: {e}")
-    logger.info("paper manual settle %s: %s", strategy_id, result)
+    logger.info("wencai manual settle %s: %s", strategy_id, result)
     return {"ok": True, **result}
 
 
