@@ -1,1219 +1,685 @@
-# -*- coding: utf-8 -*-
-"""问财实盘模拟 — 交易引擎与数据模型测试（使用假行情，不依赖仓库/网络）。"""
+"""虚拟账户(模拟盘)域模块测试 — 撮合口径 / 账务一致性 / 管道幂等。
+
+设计文档: docs/paper-trading-plan.md。价格全程不复权 raw 价;
+台账 append-only, 持仓/现金由重放推导, 修复以追加记录表达。
+"""
 from __future__ import annotations
 
-import dataclasses
-import json
+from datetime import date, datetime, time, timedelta
 
+import polars as pl
 import pytest
 
-from app.paper import context
-from app.paper.market import DayRow, MarketData
-from app.paper.models import (Account, BuyRule, PaperStrategy, SellRule,
-                              LOT, Position)
-from app.paper.scheduler import PaperScheduler, _simulate
-from app.paper.service import MarketDataNotReadyError, run_simulate
-from app.paper.store import PaperStore
-from app.paper.trading import (_exit_fill_price, attach_trade_pnl, decide_exit,
-                               entry_signal_passes, process_day,
-                               replay_account)
-
-
-class FakeMarket:
-    """内存假行情：{date: {symbol: DayRow}} + 涨停/跌停价表。"""
-
-    def __init__(self, rows=None, limit_up=None, limit_down=None):
-        self.rows = rows or {}
-        self.limit_up = limit_up or {}
-        self.limit_down = limit_down or {}
-        self.day_rows_calls: list[tuple[str, tuple[str, ...]]] = []
-
-    def day_rows(self, date: str, signal_ids=None):
-        self.day_rows_calls.append((date, tuple(sorted(signal_ids or ()))))
-        return self.rows.get(date, {})
-
-    def symbol_limit_up(self, symbol: str):
-        return self.limit_up.get(symbol)
-
-    def buyable_at_open(self, symbol: str, row: DayRow | None):
-        if row is None or row.open is None or row.open <= 0 or row.volume <= 0:
-            return False
-        lim = self.symbol_limit_up(symbol)
-        if lim and row.open >= lim - 0.001:
-            return False
-        return True
-
-    def sellable_at_open(self, symbol: str, row: DayRow | None):
-        if row is None or row.close is None or row.close <= 0:
-            return False
-        lim = self.limit_down.get(symbol)
-        return not (lim and row.open is not None and row.open > 0
-                    and row.open <= lim + 0.001)
-
-    def limit_down_open_sell_price(self, symbol: str, row: DayRow | None):
-        if row is None or row.open is None or row.open <= 0 \
-                or row.close is None or row.close <= 0:
-            return None
-        dn = self.limit_down.get(symbol)
-        if dn is None or row.open > dn + 0.001:
-            return None
-        high = row.high if (row.high is not None and row.high > 0) else None
-        if high is None or high <= dn + 0.001:
-            return None
-        return dn
-
-    def limit_up_open_buy_price(self, symbol: str, row: DayRow | None):
-        if row is None or row.open is None or row.open <= 0 \
-                or row.volume is None or row.volume <= 0:
-            return None
-        lim = self.symbol_limit_up(symbol)
-        if lim is None or row.open < lim - 0.001:
-            return None
-        low = row.low if (row.low is not None and row.low > 0) else None
-        if low is None or low >= lim - 0.001:
-            return None
-        return lim
-
-
-def r(symbol, open_, close, volume=100000, csg=None, high=None, low=None, prev_close=None):
-    return DayRow(symbol=symbol, open=open_, close=close, volume=volume, csg=csg or {},
-                  high=high, low=low, prev_close=prev_close)
-
-
-def make_account(cash=100000):
-    return Account.create("acc1", "测试账户", cash)
-
-
-def make_strategy(**kw):
-    defaults = dict(strategy_id="strat1", name="策略", account_id="acc1",
-                    iwencai_query="query")
-    defaults.update(kw)
-    return PaperStrategy.create(**defaults)
-
-
-def test_strategy_created_at_backfill(tmp_path):
-    """created_at: 新建策略取今天; 历史记录(无 created_at)按最早落盘日期回填并持久化。"""
-    from app.paper.store import PaperStore
-    store = PaperStore(tmp_path)
-    s = make_strategy()
-    assert s.created_at, "create() 应写入创建日期"
-    store.save_strategies({"strat1": s})
-    strat_file = tmp_path / "paper" / "strategies.json"
-    # 模拟历史数据: 抹掉 created_at, 最早每日快照为 2026-01-02
-    raw = json.loads(strat_file.read_text(encoding="utf-8"))
-    raw[0].pop("created_at")
-    strat_file.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
-    (tmp_path / "paper" / "days" / "2026-01-02").mkdir(parents=True)
-    (tmp_path / "paper" / "days" / "2026-01-02" / "strat1.json").write_text("{}", encoding="utf-8")
-    loaded = store.load_strategies()
-    assert loaded["strat1"].created_at == "2026-01-02", "应按最早落盘日期回填"
-    # 回填结果已持久化, 二次加载稳定
-    again = json.loads(strat_file.read_text(encoding="utf-8"))
-    assert again[0]["created_at"] == "2026-01-02"
-    assert store.load_strategies()["strat1"].created_at == "2026-01-02"
-
-
-# ── 信号求值 ────────────────────────────────────────────
-
-
-def test_entry_no_signal_buys_all():
-    s = make_strategy()
-    assert entry_signal_passes(s, r("000001", 10, 10)) is True
-
-
-def test_entry_signal_all_must_true():
-    s = make_strategy()
-    s.buy_rule.signal_ids = ["sig_a", "sig_b"]
-    assert entry_signal_passes(s, r("000001", 10, 10, csg={"csg_sig_a": True, "csg_sig_b": True})) is True
-    assert entry_signal_passes(s, r("000001", 10, 10, csg={"csg_sig_a": True, "csg_sig_b": False})) is False
-    assert entry_signal_passes(s, r("000001", 10, 10, csg={"csg_sig_a": True})) is False
-
-
-def test_exit_reasons():
-    s = make_strategy()
-    s.sell_rule = SellRule(stop_loss_pct=-0.1, take_profit_pct=0.2, max_hold_days=3)
-    pos = Position("000001", 100, 10, "2026-01-01", hold_days=0)
-    # 未触发任何条件
-    assert decide_exit(s, dataclasses.replace(pos, **{"hold_days": 0}),
-                       r("000001", 10, 11), "2026-01-02") is None
-    # 止盈
-    assert decide_exit(s, pos, r("000001", 10, 12.5), "2026-01-02") == "take_profit"
-    # 止损
-    assert decide_exit(s, pos, r("000001", 10, 8.9), "2026-01-02") == "stop_loss"
-    # 最长持有
-    assert decide_exit(s, dataclasses.replace(pos, **{"hold_days": 3}),
-                       r("000001", 10, 11), "2026-01-02") == "max_hold"
-
-
-def test_exit_prev_close_stop_loss():
-    """止损-前收: 盘中 low 触及 前收×(1+pct) 即触发; 无前收则不判定该条件。"""
-    s = make_strategy()
-    s.sell_rule = SellRule(stop_loss_prev_close_pct=-0.05)
-    pos = Position("000001", 100, 10, "2026-01-01", hold_days=0)
-    # prev_close=10 → 线 9.5; low 9.4 触及触发
-    assert decide_exit(s, pos, r("000001", 9.6, 9.45, low=9.4, prev_close=10.0),
-                       "2026-01-02") == "stop_loss_prev"
-    # low 9.6 未触及线 9.5
-    assert decide_exit(s, pos, r("000001", 9.8, 9.7, low=9.6, prev_close=10.0),
-                       "2026-01-02") is None
-    # 无前收（prev_close 缺失/非正）→ 该条件不判定
-    assert decide_exit(s, pos, r("000001", 9.0, 9.0, low=9.0), "2026-01-02") is None
-    assert decide_exit(s, pos, r("000001", 9.0, 9.0, low=9.0, prev_close=0),
-                       "2026-01-02") is None
-
-
-def test_exit_prev_close_fill_price():
-    """止损-前收按线价成交, 开盘跳空穿越线位时按开盘价成交。"""
-    rule = SellRule(stop_loss_prev_close_pct=-0.05)
-    s = make_strategy()
-    s.sell_rule = rule
-    pos = Position("000001", 100, 10, "2026-01-01")
-    # 盘中触发: 开盘 9.7 高于线 9.5 → 按线价 9.5 成交
-    assert _exit_fill_price(rule, pos, r("000001", 9.7, 9.4, low=9.4, prev_close=10.0),
-                            "stop_loss_prev") == pytest.approx(9.5)
-    # 跳空低开穿越线位: 开盘 9.2 → 按开盘价 9.2 成交
-    assert _exit_fill_price(rule, pos, r("000001", 9.2, 9.1, low=9.1, prev_close=10.0),
-                            "stop_loss_prev") == pytest.approx(9.2)
-
-
-def test_exit_prev_close_take_profit():
-    """止盈-前收: 盘中 high 触及 前收×(1+pct) 即触发; 无前收则不判定该条件。"""
-    s = make_strategy()
-    s.sell_rule = SellRule(take_profit_prev_close_pct=0.05)
-    pos = Position("000001", 100, 10, "2026-01-01", hold_days=0)
-    # prev_close=10 → 线 10.5; high 10.6 触及触发
-    assert decide_exit(s, pos, r("000001", 10.2, 10.5, high=10.6, prev_close=10.0),
-                       "2026-01-02") == "take_profit_prev"
-    # high 10.4 未触及线 10.5
-    assert decide_exit(s, pos, r("000001", 10.1, 10.3, high=10.4, prev_close=10.0),
-                       "2026-01-02") is None
-    # 无前收（prev_close 缺失/非正）→ 该条件不判定
-    assert decide_exit(s, pos, r("000001", 10.8, 10.9, high=10.9), "2026-01-02") is None
-    assert decide_exit(s, pos, r("000001", 10.8, 10.9, high=10.9, prev_close=0),
-                       "2026-01-02") is None
-
-
-def test_exit_prev_close_take_profit_fill_price():
-    """止盈-前收按线价成交, 开盘跳空高开穿越线位时按开盘价成交。"""
-    rule = SellRule(take_profit_prev_close_pct=0.05)
-    pos = Position("000001", 100, 10, "2026-01-01")
-    # 盘中触发: 开盘 10.2 低于线 10.5 → 按线价 10.5 成交
-    assert _exit_fill_price(rule, pos, r("000001", 10.2, 10.6, high=10.6, prev_close=10.0),
-                            "take_profit_prev") == pytest.approx(10.5)
-    # 跳空高开穿越线位: 开盘 10.8 → 按开盘价 10.8 成交
-    assert _exit_fill_price(rule, pos, r("000001", 10.8, 10.9, high=10.9, prev_close=10.0),
-                            "take_profit_prev") == pytest.approx(10.8)
-
-
-def test_exit_signal_or_rule():
-    s = make_strategy()
-    s.sell_rule = SellRule(exit_signal_ids=["out"])
-    assert decide_exit(s, Position("000001", 100, 10, "2026-01-01"),
-                       r("000001", 10, 11, csg={"csg_out": True}), "2026-01-02") == "exit_signal"
-    assert decide_exit(s, Position("000001", 100, 10, "2026-01-01"),
-                       r("000001", 10, 11, csg={"csg_out": False}), "2026-01-02") is None
-
-
-# ── 完整结算：买入（次日开盘） ────────────────────────────
-
-
-def test_buy_fills_at_next_open():
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10.5)},
-    })
-    acct = make_account()
-    s = make_strategy()
-    trades, snap = process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    assert len(trades) == 0, "候选在当日生成，PB 应在次日开盘成交"
-    assert len(snap.trades) == 0
-    assert len(acct.pending) == 1
-    assert acct.pending[0].symbol == "000001"
-
-    mk2 = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10.5)},
-        "2026-01-03": {"000001": r("000001", 10.2, 11)},
-    })
-    trades, snap = process_day(mk2, acct, s, "2026-01-03", candidates=[])
-    buys = [t for t in trades if t.side == "buy"]
-    assert len(buys) == 1
-    assert buys[0].price == 10.2, "次日开盘价成交"
-    # 单一致策略默认 max_position_pct=0.2 → 预算20000，10.5定价 → 1900股
-    assert acct.positions["000001"].qty == 1900
-    assert acct.positions["000001"].qty % LOT == 0
-    assert round(acct.positions["000001"].avg_cost, 2) == round(10.2, 2)
-    assert acct.cash == 100000 - 1900 * 10.2
-
-
-def test_buy_skips_suspended_and_limit_up():
-    # 000001 停牌（下一日缺失）、000002 涨停被跳过
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10), "000002": r("000002", 10, 10)},
-        "2026-01-03": {"000002": r("000002", 12, 12)},
-    }, limit_up={"000002": 12.0})
-    acct = make_account()
-    s = make_strategy()
-    s.buy_rule.max_symbols = 0
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001", "000002"])
-    assert len(acct.pending) == 2
-    trades, _ = process_day(mk, acct, s, "2026-01-03", candidates=[])
-    # 000001 停牌继续挂单；000002 开盘=12=涨停 → 跳过
-    assert [t.symbol for t in trades if t.side == "buy"] == []
-    assert {p.symbol for p in acct.pending} == {"000001", "000002"}
-    assert acct.cash == 100000
-
-
-# ── 卖出 ────────────────────────────────────────────────
-
-
-def test_sell_at_close_and_t1():
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        "2026-01-03": {"000001": r("000001", 10, 12)},
-        "2026-01-04": {"000001": r("000001", 10, 9)},
-    })
-    acct = make_account()
-    s = make_strategy()
-    s.sell_rule = SellRule(stop_loss_pct=-0.1, take_profit_pct=0.2)
-
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])  # 生成PB
-    _t, sep = process_day(mk, acct, s, "2026-01-03", candidates=[])  # 10.2? 买入
-    # T+1：当天买入（entry_date=2026-01-03）不能在 01-03 卖出
-    assert [t.side for t in sep.trades] == ["buy"]
-    assert "000001" in acct.positions
-    # 01-04：成本10 → 收盘9 → 跌停? close9 相对成本-10% 触发止损
-    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
-    sells = [t for t in trades if t.side == "sell"]
-    assert len(sells) == 1
-    assert sells[0].reason == "stop_loss"
-    assert sells[0].price == 9
-    assert "000001" not in acct.positions
-    # 2000股@10买入(20000) → 2000股@9卖出(18000)，亏损
-    assert acct.cash == 100000 - 2000 * 10 + 2000 * 9
-
-
-def test_exit_signal_sell():
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        "2026-01-03": {"000001": r("000001", 10.2, 11)},
-        "2026-01-04": {"000001": r("000001", 11, 11, csg={"csg_out": True})},
-    })
-    acct = make_account()
-    s = make_strategy()
-    s.sell_rule = SellRule(exit_signal_ids=["out"])
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    process_day(mk, acct, s, "2026-01-03", candidates=[])
-    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
-    assert [t.reason for t in trades if t.side == "sell"] == ["exit_signal"]
-
-
-# ── 结算与快照 ──────────────────────────────────────────
-
-
-def test_day_snapshot_nav_and_hold_days():
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        "2026-01-03": {"000001": r("000001", 10, 11)},
-    })
-    acct = make_account(cash=10000)
-    s = make_strategy()
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    _, snap = process_day(mk, acct, s, "2026-01-03", candidates=[])
-    assert acct.positions["000001"].hold_days == 1
-    # 单一致候选预算=min(10000, 10000*0.2)=2000，10元定价 → 200股
-    assert acct.positions["000001"].qty == 200
-    assert round(snap.market_value, 2) == round(200 * 11, 2)
-    assert round(snap.total_value, 2) == round(acct.cash + 200 * 11, 2)
-    assert snap.nav > 1.0
-
-
-def test_pending_carries_over_holiday():
-    # 候选 01-02，但 01-03 无数据（假日/停牌批量缺失），01-04 才成交
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        "2026-01-04": {"000001": r("000001", 15, 15)},
-    })
-    acct = make_account()
-    s = make_strategy()
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    t1, _ = process_day(mk, acct, s, "2026-01-03", candidates=[])
-    assert [x.side for x in t1] == [], "假日无行情，PB 继续挂单"
-    assert len(acct.positions) == 0
-    t2, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
-    assert [x.side for x in t2] == ["buy"]
-    # 候选日在01-02定价(10元,预算20000)即确定2000股，成交日资金充足全量成交
-    assert acct.positions["000001"].qty == 2000
-
-
-# ── 模型/规则校验 ───────────────────────────────────────
-
-
-def test_buy_rule_validation():
-    with pytest.raises(ValueError):
-        BuyRule.from_dict({"max_position_pct": 1.2})
-    with pytest.raises(ValueError):
-        BuyRule.from_dict({"signal_ids": "not-a-list"})
-    with pytest.raises(ValueError):
-        BuyRule.from_dict({"max_total_pct": 1.2})
-    with pytest.raises(ValueError):
-        BuyRule.from_dict({"sort_order": "sideways"})
-    with pytest.raises(ValueError):
-        BuyRule.from_dict({"top_n": -1})
-    assert BuyRule.from_dict({}).max_position_pct == 0.2
-    assert BuyRule.from_dict({}).sort_order == "desc"
-
-
-def test_sell_rule_validation():
-    with pytest.raises(ValueError):
-        SellRule.from_dict({"stop_loss_pct": -1.5})
-    with pytest.raises(ValueError):
-        SellRule.from_dict({"max_hold_days": 0})
-
-
-def test_sell_rule_rejects_wrong_sign():
-    """止损必须为负、止盈必须为正。
-
-    线价 = 成本价 × (1 + pct)，符号填反会把线价放到现价另一侧而恒触发：
-    止损填 +0.1 → 线价 成本×1.1，任何低于它的价格都算跌破止损（dde_03 首日误止损的成因）。
-    """
-    with pytest.raises(ValueError, match="必须为负数"):
-        SellRule.from_dict({"stop_loss_pct": 0.1})
-    with pytest.raises(ValueError, match="必须为负数"):
-        SellRule.from_dict({"stop_loss_prev_close_pct": 0.05})
-    with pytest.raises(ValueError, match="必须为正数"):
-        SellRule.from_dict({"take_profit_pct": -0.2})
-    with pytest.raises(ValueError, match="必须为正数"):
-        SellRule.from_dict({"take_profit_prev_close_pct": -0.1})
-    # 合法符号正常通过
-    ok = SellRule.from_dict({"stop_loss_pct": -0.08, "take_profit_pct": 0.3})
-    assert ok.stop_loss_pct == -0.08 and ok.take_profit_pct == 0.3
-
-
-def test_lot_rounding():
-    mk = FakeMarket({"2026-01-02": {"000001": r("000001", 10, 10)}})
-    acct = make_account()
-    s = make_strategy()
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    qty = acct.pending[0].qty
-    assert qty % LOT == 0 and qty >= LOT
-
-
-# ── 按字段排序 + TopN ────────────────────────────────────
-
-
-def test_buy_sort_by_field_then_topn():
-    mk = FakeMarket({"2026-01-02": {
-        "000001": r("000001", 10, 10),
-        "000002": r("000002", 10, 10),
-        "000003": r("000003", 10, 10),
-    }})
-    acct = make_account()
-    s = make_strategy()
-    s.buy_rule = BuyRule.from_dict({
-        "max_position_pct": 0.3, "max_symbols": 0,
-        "sort_field": "dde_net", "sort_order": "desc", "top_n": 2,
-    })
-    iwencai = {
-        "000001": {"dde_net": 3.0},
-        "000002": {"dde_net": 9.0},
-        "000003": {"dde_net": 1.5},
-    }
-    process_day(mk, acct, s, "2026-01-02",
-                candidates=["000001", "000002", "000003"], iwencai_rows=iwencai)
-    picks = [p.symbol for p in acct.pending]
-    assert picks == ["000002", "000001"], "应按 dde_net 降序取前2"
-
-
-def test_buy_sort_missing_field_dropped_last():
-    mk = FakeMarket({"2026-01-02": {
-        "000001": r("000001", 10, 10),
-        "000002": r("000002", 10, 10),
-    }})
-    acct = make_account()
-    s = make_strategy()
-    s.buy_rule = BuyRule.from_dict(
-        {"sort_field": "dde_net", "sort_order": "desc", "top_n": 0})
-    iwencai = {"000002": {"dde_net": 5.0}}  # 000001 缺 dde_net
-    process_day(mk, acct, s, "2026-01-02",
-                candidates=["000001", "000002"], iwencai_rows=iwencai)
-    assert [p.symbol for p in acct.pending] == ["000002", "000001"], "缺值的 000001 应排末尾（仍可选）"
-
-
-# ── 总仓位上限（半仓） ───────────────────────────────────
-
-
-def test_buy_total_pct_cap_half():
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10), "000002": r("000002", 10, 10)},
-        "2026-01-03": {"000001": r("000001", 10, 10), "000002": r("000002", 10, 10)},
-    })
-    acct = make_account(cash=100000)
-    s = make_strategy()
-    s.buy_rule = BuyRule.from_dict(
-        {"max_position_pct": 1.0, "max_total_pct": 0.5, "max_symbols": 0})
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001", "000002"])
-    invested = sum(p.qty * 10 for p in acct.pending)
-    assert invested == 50000, "总仓位上限=半仓，首日投入应恰为 50000"
-
-    # 次日 PB 成交后账户回到半仓，再次生成买入：已占满预算，不再新增
-    _t, _sn = process_day(mk, acct, s, "2026-01-03", candidates=["000001", "000002"])
-    assert acct.positions["000001"].qty == 5000
-    assert not acct.pending, "已达半仓，不应新增买入"
-    assert round(acct.cash, 2) == 50000.0
-
-
-# ── 当日开盘价买入（buy_time = same_open） ───────────────
-
-
-def test_buy_same_open_uses_today_open_price():
-    mk = FakeMarket({"2026-01-02": {"000001": r("000001", 10, 12)}})
-    acct = make_account()
-    s = make_strategy()
-    s.buy_rule = BuyRule.from_dict(
-        {"buy_time": "same_open", "max_position_pct": 0.5, "max_symbols": 0})
-    trades, _ = process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    buys = [t for t in trades if t.side == "buy"]
-    assert len(buys) == 1
-    assert buys[0].price == 10, "当日买入应按当日开盘价 10 成交，而非收盘价 12"
-    assert buys[0].reason == "entry_fill"
-    # 当日开盘价 10，预算 min(100000,100000*0.5)=50000 → 5000 股
-    assert acct.positions["000001"].qty == 5000
-    assert acct.positions["000001"].avg_cost == 10
-    assert not acct.pending, "same_open 不应生成待买入单"
-    assert round(acct.cash, 2) == 100000 - 5000 * 10
-
-
-def test_buy_same_open_position_minus_marketvalue_nextopen_differs():
-    # 当日开盘买入后，结算市值按当日收盘价评估（区别于买入价）
-    mk = FakeMarket({"2026-01-02": {"000001": r("000001", 10, 12)}})
-    acct = make_account()
-    s = make_strategy()
-    s.buy_rule = BuyRule.from_dict({"buy_time": "same_open", "max_position_pct": 0.5})
-    _, snap = process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    assert round(snap.market_value, 2) == 5000 * 12, "持仓市值应按收盘价评估"
-
-
-# ── 结算数据就绪检查（run_simulate） ─────────────────────
-
-
-def _seed_store(tmp_path) -> PaperStore:
-    store = PaperStore(tmp_path)
-    store.save_accounts({"acc1": Account.create("acc1", "测试账户", 100000.0)})
-    store.save_strategies({"strat1": PaperStrategy.create("strat1", "策略", "acc1", "query")})
-    return store
-
-
-def test_run_simulate_raises_when_day_rows_missing(tmp_path):
-    """当日 enriched 未落盘：明确报错且不落任何结算产物（fail-closed）。"""
-    store = _seed_store(tmp_path)
-    s = store.load_strategies()["strat1"]
-    with pytest.raises(MarketDataNotReadyError, match="尚未就绪"):
-        run_simulate(store, FakeMarket({}), s, "2026-01-02")
-    assert store.list_day_dates("strat1") == [], "未就绪时不应写日快照"
-    assert store.load_trades("strat1") == []
-    assert store.load_accounts()["acc1"].cash == 100000.0
-
-
-def test_run_simulate_ok_when_day_rows_ready(tmp_path):
-    store = _seed_store(tmp_path)
-    s = store.load_strategies()["strat1"]
-    mk = FakeMarket({"2026-01-02": {"000001": r("000001", 10, 11)}})
-    result = run_simulate(store, mk, s, "2026-01-02",
-                          fallback_candidates=["000001"])
-    assert result["date"] == "2026-01-02"
-    assert store.list_day_dates("strat1") == ["2026-01-02"]
-
-
-# ── 调度器：结算未就绪跳过 / 就绪正常结算 ────────────────
-
-
-def test_simulate_skips_when_data_not_ready(tmp_path):
-    """数据未就绪时不抛异常、不落任何结算产物(调度器仅记告警)。"""
-    store = _seed_store(tmp_path)
-    mk = FakeMarket({})  # 当日无行情
-    sched = PaperScheduler(store, mk)
-    context.set_instances(store, mk, sched)
-    sched.start()
-    try:
-        _simulate("strat1", date_str="2026-01-02")  # 不应抛出
-        assert store.list_day_dates("strat1") == [], "未就绪时不应写日快照"
-        assert store.load_trades("strat1") == []
-    finally:
-        sched.stop()
-
-
-def test_simulate_settles_when_data_ready(tmp_path):
-    store = _seed_store(tmp_path)
-    mk = FakeMarket({"2026-01-02": {"000001": r("000001", 10, 11)}})
-    sched = PaperScheduler(store, mk)
-    context.set_instances(store, mk, sched)
-    sched.start()
-    try:
-        _simulate("strat1", date_str="2026-01-02")
-        assert store.list_day_dates("strat1") == ["2026-01-02"]
-    finally:
-        sched.stop()
-
-
-def test_process_day_passes_strategy_signals_to_market():
-    """process_day 应把策略买卖规则引用的信号集传给 day_rows(按需计算 csg 列)。"""
-    mk = FakeMarket({"2026-01-02": {"000001": r("000001", 10, 10)}})
-    acct = make_account()
-    s = make_strategy()
-    s.buy_rule.signal_ids = ["sig_a"]
-    s.sell_rule.exit_signal_ids = ["out_b"]
-    process_day(mk, acct, s, "2026-01-02", candidates=[])
-    assert mk.day_rows_calls == [("2026-01-02", ("out_b", "sig_a"))]
-
-
-# ── 代码格式对齐(问财 6 位码 vs 行情带后缀) ────────────
-
-
-def test_process_day_aligns_iwencai_code_to_market_symbol():
-    """问财候选/字段为 6 位码、行情键带交易所后缀时, 结算应能正常买入。
-
-    回归测试: 此前 rows.get(6位码) 全部落空导致静默零成交。
-    """
-    mk = FakeMarket({"2026-01-02": {
-        "603976.SH": r("603976.SH", 36.1, 37.0),
-        "000523.SZ": r("000523.SZ", 3.96, 4.0),
-        "600371.SH": r("600371.SH", 2.5, 2.6),
-    }})
-    acct = make_account()
-    s = make_strategy()
-    s.buy_rule.buy_time = "same_open"
-    s.buy_rule.sort_field = "dde_net"
-    s.buy_rule.sort_order = "desc"
-    s.buy_rule.top_n = 3
-    s.buy_rule.max_position_pct = 0.5
-    cands = ["603976", "000523", "600371"]
-    iwencai_rows = {
-        "603976": {"dde_net": 0.012, "name": "正川股份"},
-        "000523": {"dde_net": 0.28, "name": "红棉股份"},
-        "600371": {"dde_net": 0.054, "name": "华远地产"},
-    }
-    trades, _ = process_day(mk, acct, s, "2026-01-02", cands, iwencai_rows)
-    bought = {t.symbol for t in trades if t.side == "buy"}
-    assert bought == {"603976.SH", "000523.SZ", "600371.SH"}, \
-        "候选与字段代码应自动对齐到行情格式并完成买入"
-
-
-# ── 一字板/开盘涨停不买入 ────────────────────────────────
-
-
-def test_market_buyable_at_open_rejects_one_word_board(tmp_path):
-    """一字板(最高=最低, 全天封死)与开盘涨停都不可买。"""
-    mk = MarketData(tmp_path / "no_such_data")
-    one_word = DayRow(symbol="000523.SZ", open=3.96, close=3.96,
-                      volume=1000, high=3.96, low=3.96)
-    assert mk.buyable_at_open("000523.SZ", one_word) is False, "一字板应不可买"
-    normal = DayRow(symbol="600000.SH", open=10.0, close=10.5,
-                    volume=1000, high=10.8, low=9.9)
-    assert mk.buyable_at_open("600000.SH", normal) is True
-
-
-def test_market_limit_up_open_rejected_for_rounded_down_limit(tmp_path):
-    """2026-09-22 中国长城回归: 涨停价向下取整(残差>旧容差0.001)时, 开盘涨停
-    必须判为封板不可买; 「涨停打开买入」开启时按涨停价排队成交。"""
-    mk = MarketData(tmp_path / "no_such_data")
-    # 真实行情: 昨收 14.84 → 涨停 14.84×1.1=16.324 → 交易所取整 16.32
-    row = DayRow(symbol="000066.SZ", open=16.32, close=15.87, volume=1000,
-                 high=16.32, low=15.60, prev_close=14.84)
-    assert mk.buyable_at_open("000066.SZ", row) is False, "开盘涨停应不可买"
-    assert mk.limit_up_open_buy_price("000066.SZ", row) == 16.32, "盘中炸板按涨停价排队"
-
-    # 未触及涨停的正常高开仍可买(+9%)
-    normal = DayRow(symbol="000066.SZ", open=16.18, close=16.0, volume=1000,
-                    high=16.30, low=15.90, prev_close=14.84)
-    assert mk.buyable_at_open("000066.SZ", normal) is True
-    assert mk.limit_up_open_buy_price("000066.SZ", normal) is None
-
-
-def test_same_open_skips_open_limit_up(tmp_path):
-    """same_open 买入时开盘涨停/一字板跳过, 其余候选照常买入。"""
-    mk = FakeMarket(
-        {"2026-01-02": {
-            "000523": r("000523", 3.96, 3.96, volume=1000),
-            "600000": r("600000", 10.0, 10.2, volume=1000),
-        }},
-        limit_up={"000523": 3.96},
+from app.market_time import CN_TZ
+from app.strategy import paper
+from app.tickflow.repository import DataStore, KlineRepository
+
+SYM = "600519.SH"
+
+
+def _cap_account(tmp_path, cash: float = 1_000_000.0) -> dict:
+    return paper.create_account(tmp_path, cash)
+
+
+def _write_daily(tmp_path, rows: list[tuple[date, float, float]]) -> None:
+    """写 kline_daily 分区: [(day, open, close)] (不复权 raw 价)。"""
+    repo = KlineRepository(DataStore(tmp_path))
+    df = pl.DataFrame(
+        {
+            "symbol": [SYM] * len(rows),
+            "date": [r[0] for r in rows],
+            "open": [r[1] for r in rows],
+            "high": [max(r[1], r[2]) for r in rows],
+            "low": [min(r[1], r[2]) for r in rows],
+            "close": [r[2] for r in rows],
+            "volume": [10000.0] * len(rows),
+            "amount": [r[2] * 10000.0 for r in rows],
+        }
     )
-    acct = make_account()
-    s = make_strategy()
-    s.buy_rule.buy_time = "same_open"
-    s.buy_rule.sort_field = "dde_net"
-    s.buy_rule.sort_order = "desc"
-    s.buy_rule.top_n = 2
-    s.buy_rule.max_position_pct = 0.5
-    trades, snap = process_day(
-        mk, acct, s, "2026-01-02", ["000523", "600000"],
-        {"000523": {"dde_net": 0.9}, "600000": {"dde_net": 0.1}})
-    bought = {t.symbol for t in trades if t.side == "buy"}
-    assert bought == {"600000"}, "开盘涨停的 000523 应被跳过"
-    assert "000523" not in snap.positions
+    repo.append_daily(df)
 
 
-def test_run_simulate_falls_back_to_same_query_snapshot(tmp_path):
-    """本策略当日快照为空时, 复用同问句已启用策略的非空快照(网关偶发返回空结果)。"""
-    store = _seed_store(tmp_path)
-    accounts = store.load_accounts()
-    accounts["acc2"] = Account.create("acc2", "账户2", 100000.0)
-    store.save_accounts(accounts)
-    strategies = store.load_strategies()
-    strategies["strat2"] = PaperStrategy.create("strat2", "同问句", "acc2", "query")
-    store.save_strategies(strategies)
-    # strat1 当日空快照, strat2 正常命中 1 只
-    store.save_iwencai_snapshot("2026-01-02", "strat1",
-                                {"strategy_id": "strat1", "symbols": [], "count": 0,
-                                 "rows": [], "fields": {}})
-    store.save_iwencai_snapshot("2026-01-02", "strat2",
-                                {"strategy_id": "strat2", "symbols": ["000001"], "count": 1,
-                                 "rows": [], "fields": {"000001": {"name": "平安银行"}}})
-    s1 = store.load_strategies()["strat1"]
-    s1.buy_rule.buy_time = "same_open"  # 默认 next_open 当日只挂单不建仓
-    mk = FakeMarket({"2026-01-02": {"000001": r("000001", 10, 11)}})
-
-    result = run_simulate(store, mk, s1, "2026-01-02")
-
-    assert result["candidates"] == 1, "应复用 strat2 的非空快照"
-    assert "000001" in store.load_accounts()["acc1"].positions
+def _write_factor(tmp_path, day: date, factor: float, asset_type: str = "stock") -> None:
+    sub = "adj_factor_etf" if asset_type == "etf" else "adj_factor"
+    out = tmp_path / sub / "all.parquet"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {"symbol": [SYM], "trade_date": [day], "ex_factor": [factor]},
+        schema={"symbol": pl.String, "trade_date": pl.Date, "ex_factor": pl.Float64},
+    ).write_parquet(out)
 
 
-def test_run_simulate_no_fallback_when_query_differs_or_disabled(tmp_path):
-    """问句不同或对方策略已停用时, 不复用其快照。"""
-    store = _seed_store(tmp_path)
-    accounts = store.load_accounts()
-    accounts["acc2"] = Account.create("acc2", "账户2", 100000.0)
-    store.save_accounts(accounts)
-    strategies = store.load_strategies()
-    other = PaperStrategy.create("strat2", "不同问句", "acc2", "另一问句")
-    other.enabled = False  # 停用即不复用
-    strategies["strat2"] = other
-    store.save_strategies(strategies)
-    store.save_iwencai_snapshot("2026-01-02", "strat2",
-                                {"strategy_id": "strat2", "symbols": ["000001"], "count": 1,
-                                 "rows": [], "fields": {}})
-    s1 = store.load_strategies()["strat1"]
-    mk = FakeMarket({"2026-01-02": {"000001": r("000001", 10, 11)}})
-
-    result = run_simulate(store, mk, s1, "2026-01-02")
-
-    assert result["candidates"] == 0
-    assert store.load_accounts()["acc1"].positions == {}
+# ── 纯函数口径 ──────────────────────────────────────────
+def test_fees_min_commission_and_stamp_tax_sell_only():
+    # 佣金最低 5 元: 100 股 x 10 元 x 万2.5 = 0.25 → 取 5
+    assert paper.buy_fee(100, 10.0, 0.00025) == 5.0
+    # 大额按比例: 10000 股 x 10 元 = 10万 x 万2.5 = 25
+    assert paper.buy_fee(10000, 10.0, 0.00025) == 25.0
+    # 印花税仅卖出: 25 + 10万 x 千1 = 125
+    assert paper.sell_fee(10000, 10.0, 0.00025, 0.001) == 25.0 + 100.0
+    assert paper.buy_fee(10000, 10.0, 0.001) == 100.0
 
 
-def test_run_fetch_reuses_same_query_snapshot_without_api_call(tmp_path, monkeypatch):
-    """当日已有同问句策略的非空快照时, 复用其数据落盘副本并跳过网关调用。"""
-    from datetime import date as _date
-
-    from app.paper import iwencai_service as isvc
-    from app.paper.service import run_fetch
-
-    store = _seed_store(tmp_path)
-    accounts = store.load_accounts()
-    accounts["acc2"] = Account.create("acc2", "账户2", 100000.0)
-    store.save_accounts(accounts)
-    strategies = store.load_strategies()
-    strategies["strat2"] = PaperStrategy.create("strat2", "同问句", "acc2", "query")
-    store.save_strategies(strategies)
-
-    today = _date.today().isoformat()
-    store.save_iwencai_snapshot(today, "strat2",
-                                {"strategy_id": "strat2", "bucket": "daily",
-                                 "symbols": ["000001"], "count": 1, "rows": [],
-                                 "fields": {"000001": {"name": "平安银行"}}})
-
-    def _boom(store, strategy, when=""):
-        raise AssertionError("同问句快照可复用时不应调用网关")
-
-    monkeypatch.setattr(isvc, "fetch_and_persist", _boom)
-
-    s1 = store.load_strategies()["strat1"]
-    out = run_fetch(store, s1, "daily")
-
-    assert out["reused"] is True and out["count"] == 1
-    own = store.load_iwencai_snapshot(today, "strat1")
-    assert own["symbols"] == ["000001"], "应有本策略自己的落盘副本"
-    assert own["strategy_id"] == "strat1" and own["bucket"] == "daily"
+def test_slippage_direction_adverse():
+    assert paper.apply_slippage(10.0, "buy", 5) > 10.0
+    assert paper.apply_slippage(10.0, "sell", 5) < 10.0
+    assert paper.apply_slippage(10.0, "buy", 5) == pytest.approx(10.005)
 
 
-# ── 卖出: 开盘跌停不卖 / 止损止盈线价 / sell_time=open ──
+def test_limit_prices_by_board():
+    assert paper.limit_pct("600519.SH", "stock") == 0.10
+    assert paper.limit_pct("000001.SZ", "stock") == 0.10
+    assert paper.limit_pct("300750.SZ", "stock") == 0.20
+    assert paper.limit_pct("688981.SH", "stock") == 0.20
+    assert paper.limit_pct("832000.BJ", "stock") == 0.30
+    assert paper.limit_pct("510300.SH", "etf") == 0.10
+    up, down = paper.limit_prices(10.0, "600519.SH", "stock")
+    assert (up, down) == (11.0, 9.0)
+    up3, down3 = paper.limit_prices(1.0, "510300.SH", "etf")
+    assert (up3, down3) == (1.1, 0.9)  # 3 位小数 round 不改变该值
 
 
-def test_sell_blocked_when_open_at_limit_down():
-    """开盘即封跌停的持仓当日不卖（跌停无法成交），继续持有。"""
-    # 成本 10，收盘 8.5 触发止损(-0.1 线 9.0)；但开盘 8.5 封跌停(跌停价 9.0? 否，
-    # 用 prev_close=10 → 跌停 9.0，open=9.0 封死) —— 用 prev_close 10/open 9/close 8.5
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        "2026-01-03": {"000001": r("000001", 10.2, 11)},
-        "2026-01-04": {"000001": r("000001", 9.0, 8.5, prev_close=9.44)},
-    }, limit_down={"000001": 9.0})
-    acct = make_account()
-    s = make_strategy()
-    s.sell_rule = SellRule(stop_loss_pct=-0.1)
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    process_day(mk, acct, s, "2026-01-03", candidates=[])  # 买入建仓
-    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
-    assert [t for t in trades if t.side == "sell"] == [], "开盘封跌停当日不可卖"
-    assert "000001" in acct.positions, "持仓应保留到下一交易日"
+def test_qty_from_amount_floors_to_lot():
+    assert paper.qty_from_amount(9_999.0, 100.0) == 0  # 不足一手
+    assert paper.qty_from_amount(10_500.0, 100.0) == 100
+    assert paper.qty_from_amount(99_000.0, 100.0) == 900
 
 
-def test_market_sellable_at_open_rejects_limit_down(tmp_path):
-    """真 MarketData: 开盘触及跌停价不可卖, 正常开盘可卖。"""
-    mk = MarketData(tmp_path / "no_such_data")
-    limit_down = DayRow(symbol="600000.SH", open=9.0, close=8.8, volume=1000,
-                        high=9.2, low=8.8, prev_close=10.0)
-    assert mk.sellable_at_open("600000.SH", limit_down) is False, "开盘=跌停价应不可卖"
-    normal = DayRow(symbol="600000.SH", open=9.5, close=9.6, volume=1000,
-                    high=9.8, low=9.3, prev_close=10.0)
-    assert mk.sellable_at_open("600000.SH", normal) is True
+# ── 下单校验 ────────────────────────────────────────────
+def test_create_order_requires_account(tmp_path):
+    with pytest.raises(ValueError, match="尚未创建"):
+        paper.create_order(tmp_path, SYM, "buy", qty=100)
 
 
-def test_stop_loss_fills_at_line_price():
-    """止损: 盘中跌破线(触发) → 成交价=止损线价, 而非收盘价。"""
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        "2026-01-03": {"000001": r("000001", 10.2, 11)},
-        # open 10.5 > 线 9.0, low 8.7 触线, 收盘 9.4 > 线
-        "2026-01-04": {"000001": r("000001", 10.5, 9.4, high=10.8, low=8.7)},
-    })
-    acct = make_account()
-    s = make_strategy()
-    s.buy_rule.buy_time = "same_open"  # 第一天(01-02)即以开盘价 10 买入, 成本线按 10 推算
-    s.sell_rule = SellRule(stop_loss_pct=-0.1)  # 线价 = 10 × 0.9 = 9.0
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    process_day(mk, acct, s, "2026-01-03", candidates=[])
-    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
-    sells = [t for t in trades if t.side == "sell"]
-    assert len(sells) == 1 and sells[0].reason == "stop_loss"
-    assert sells[0].price == pytest.approx(9.0), "应按止损线价成交"
-    assert sells[0].price != pytest.approx(9.4), "不应按收盘价成交"
+def test_create_order_rejects_bad_qty_and_insufficient_cash(tmp_path):
+    _cap_account(tmp_path, 100_000.0)
+    _, err = paper.create_order(tmp_path, SYM, "buy", qty=150)  # 非百股整数倍
+    assert "100 的整数倍" in err
+    _, err = paper.create_order(tmp_path, SYM, "buy", qty=2000, ref_price=100.0)
+    assert "资金不足" in err
 
 
-def test_take_profit_fills_at_line_price():
-    """止盈: 盘中触线(触发) → 成交价=止盈线价; 收盘回落也不影响。"""
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        "2026-01-03": {"000001": r("000001", 10.2, 11)},
-        # open 10.5, high 12.5 触及止盈线 12.0, 收盘回落 11.2
-        "2026-01-04": {"000001": r("000001", 10.5, 11.2, high=12.5, low=10.4)},
-    })
-    acct = make_account()
-    s = make_strategy()
-    s.buy_rule.buy_time = "same_open"  # 第一天(01-02)即以开盘价 10 买入, 成本线按 10 推算
-    s.sell_rule = SellRule(take_profit_pct=0.2)  # 线价 = 10 × 1.2 = 12.0
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    process_day(mk, acct, s, "2026-01-03", candidates=[])
-    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
-    sells = [t for t in trades if t.side == "sell"]
-    assert len(sells) == 1 and sells[0].reason == "take_profit"
-    assert sells[0].price == pytest.approx(12.0), "应按止盈线价成交"
+def test_create_order_etf_market_converts_to_next_open(tmp_path):
+    _cap_account(tmp_path)
+    order, err = paper.create_order(
+        tmp_path, "510300.SH", "buy", qty=1000, order_type="market", asset_type="etf", ref_price=4.0,
+    )
+    assert err is None
+    assert order["order_type"] == "next_open"
 
 
-def test_gap_through_line_fills_at_open():
-    """跳空穿越线位按开盘价成交: 低开破止损线按 open(更低), 高开破止盈线按 open(更高)。"""
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        "2026-01-03": {"000001": r("000001", 10.2, 11)},
-        # 跳空低开 8.5 < 止损线 9.0
-        "2026-01-04": {"000001": r("000001", 8.5, 8.6, high=9.1, low=8.4)},
-    })
-    acct = make_account()
-    s = make_strategy()
-    s.sell_rule = SellRule(stop_loss_pct=-0.1)
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    process_day(mk, acct, s, "2026-01-03", candidates=[])
-    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
-    sells = [t for t in trades if t.side == "sell"]
-    assert sells[0].reason == "stop_loss"
-    assert sells[0].price == pytest.approx(8.5), "跳空低开应按开盘价成交(比线价更差)"
+def test_sell_requires_holding_and_t1(tmp_path, monkeypatch):
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _cap_account(tmp_path)
+    _, err = paper.create_order(tmp_path, SYM, "sell", qty=100)
+    assert "不能卖出" in err
 
-    # 跳空高开破止盈线: open 12.6 > 线 12.0 → 按 12.6 成交
-    mk2 = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        "2026-01-03": {"000001": r("000001", 10.2, 11)},
-        "2026-01-04": {"000001": r("000001", 12.6, 12.1, high=12.8, low=11.9)},
-    })
-    acct2 = make_account()
-    s2 = make_strategy()
-    s2.sell_rule = SellRule(take_profit_pct=0.2)
-    process_day(mk2, acct2, s2, "2026-01-02", candidates=["000001"])
-    process_day(mk2, acct2, s2, "2026-01-03", candidates=[])
-    trades2, _ = process_day(mk2, acct2, s2, "2026-01-04", candidates=[])
-    sells2 = [t for t in trades2 if t.side == "sell"]
-    assert sells2[0].reason == "take_profit"
-    assert sells2[0].price == pytest.approx(12.6), "跳空高开应按开盘价成交(比线价更好)"
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    buy_order, err = paper.create_order(tmp_path, SYM, "buy", qty=100, ref_price=10.0)
+    assert err is None
+    assert buy_order["status"] == "pending"
+    assert len(paper.evaluate_intraday(tmp_path, {SYM: 10.0})) == 1
+    # T+1: 当日买入当日不可卖
+    _, err = paper.create_order(tmp_path, SYM, "sell", qty=100)
+    assert "可卖数量不足" in err
+
+    # 次日可卖
+    monkeypatch.setattr(paper, "cn_today", lambda: day + timedelta(days=1))
+    paper._materialize(tmp_path)
+    sell, err = paper.create_order(tmp_path, SYM, "sell", qty=100)
+    assert err is None and sell["status"] == "pending"
 
 
-def test_max_hold_days_1_sells_next_open():
-    """持股天数=1 + sell_time=open: 第一天买入, 第二天以开盘价卖出。"""
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        "2026-01-03": {"000001": r("000001", 10.7, 11)},
-    })
-    acct = make_account(cash=10000)
-    s = make_strategy()
-    s.buy_rule.buy_time = "same_open"  # 第一天(01-02)即买入建仓
-    s.buy_rule.max_position_pct = 0.5
-    s.sell_rule = SellRule(max_hold_days=1, sell_time="open")
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])   # 买入日
-    trades, _ = process_day(mk, acct, s, "2026-01-03", candidates=[])  # 次日
-    sells = [t for t in trades if t.side == "sell"]
-    assert len(sells) == 1 and sells[0].reason == "max_hold"
-    assert sells[0].price == pytest.approx(10.7), "持股天数=1 应在次日以开盘价卖出"
-    assert not acct.positions
+def test_cancel_pending_only(tmp_path, monkeypatch):
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _cap_account(tmp_path)
+    order, _ = paper.create_order(tmp_path, SYM, "buy", qty=100, ref_price=10.0)
+    cancelled, err = paper.cancel_order(tmp_path, order["id"])
+    assert err is None and cancelled["status"] == "cancelled"
+    _, err = paper.cancel_order(tmp_path, order["id"])
+    assert "不可撤销" in err
 
 
-def test_roll_after_sell_same_day():
-    """滚仓: 结算先卖后买, 当日卖出释放的资金与仓位额度同日即可再买入新标的。
+# ── 撮合流程 ────────────────────────────────────────────
+def test_immediate_fill_cash_and_positions_consistent(tmp_path, monkeypatch):
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    _cap_account(tmp_path)
 
-    Day1 建仓 2 只（总仓位上限 0.5, 单股上限 0.2, same_open 买入）;
-    Day2 max_hold_days=1 触发全部卖出(sell_time=open), 同日应能买入 2 只新标的。
-    """
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10), "000002": r("000002", 20, 20)},
-        "2026-01-03": {"000001": r("000001", 10, 10), "000002": r("000002", 20, 20),
-                       "000003": r("000003", 10, 10), "000004": r("000004", 20, 20)},
-    })
-    acct = make_account(cash=10000)
-    s = make_strategy()
-    s.buy_rule.max_total_pct = 0.5
-    s.buy_rule.max_position_pct = 0.2
-    s.buy_rule.buy_time = "same_open"
-    s.sell_rule = SellRule(max_hold_days=1, sell_time="open")
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001", "000002"])
-    assert len(acct.positions) == 2
-    trades, _ = process_day(mk, acct, s, "2026-01-03", candidates=["000003", "000004"])
-    sells = [t for t in trades if t.side == "sell"]
-    buys = [t for t in trades if t.side == "buy"]
-    assert len(sells) == 2 and len(buys) == 2, "卖出释放额度后同日应能再买入新标的"
-    assert {b.symbol for b in buys} == {"000003", "000004"}
-    # 再买入总额不超过总仓位上限 (0.5 × 总资产 10000 = 5000)
-    assert sum(b.amount for b in buys) <= 5000 + 1e-6
+    order, err = paper.create_order(tmp_path, SYM, "buy", qty=1000, ref_price=10.0)
+    assert err is None
+    events = paper.evaluate_intraday(tmp_path, {SYM: 10.0, "000002.SZ": 5.0})
+    assert len(events) == 1
+    # V3 成交事件: 字段对齐监控告警 (source=paper), ts 为毫秒, 文案中文可读
+    ev = events[0]
+    assert ev["source"] == "paper" and ev["type"] == "fill" and ev["severity"] == "info"
+    assert ev["symbol"] == SYM and ev["side"] == "buy" and ev["qty"] == 1000
+    assert ev["price"] == pytest.approx(10.005)
+    assert isinstance(ev["ts"], int) and ev["ts"] > 0
+    assert "买入成交" in ev["message"] and "1000股" in ev["message"]
+    filled = paper.get_order(tmp_path, order["id"])
+    # 滑点向上: 10 * 1.0005
+    assert filled["fill_price"] == pytest.approx(10.005)
+    fee = paper.buy_fee(1000, 10.005, paper.DEFAULT_COMMISSION_PCT)
+    assert filled["fees"] == pytest.approx(fee)
 
-
-def test_partial_sell_frees_quota_for_rebuy():
-    """部分卖出同样释放额度: 卖 1 只后, 剩余持仓 + 新买入 ≤ 总仓位上限。
-
-    单股上限按总资产口径: 卖出释放资金后, 新买单可按 max_position_pct × 总资产 全额配置。
-    """
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10), "000002": r("000002", 20, 20)},
-        "2026-01-03": {"000001": r("000001", 10, 10), "000002": r("000002", 20, 20),
-                       "000003": r("000003", 10, 10)},
-        # 000001 止损: prev_close 10, 线 9.5, low 9.4 触发
-        "2026-01-04": {"000001": r("000001", 9.7, 9.3, low=9.4, prev_close=10.0),
-                       "000002": r("000002", 20, 20),
-                       "000003": r("000003", 10, 10)},
-    })
-    acct = make_account(cash=10000)
-    s = make_strategy()
-    s.buy_rule.max_total_pct = 0.5
-    s.buy_rule.max_position_pct = 0.2
-    s.buy_rule.buy_time = "same_open"
-    s.sell_rule = SellRule(stop_loss_prev_close_pct=-0.05, max_hold_days=5)
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001", "000002"])
-    process_day(mk, acct, s, "2026-01-03", candidates=[])
-    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=["000003"])
-    sells = [t for t in trades if t.side == "sell"]
-    buys = [t for t in trades if t.side == "buy"]
-    assert len(sells) == 1 and sells[0].symbol == "000001"
-    assert len(buys) == 1 and buys[0].symbol == "000003", "止损卖出释放的额度应可同日再买入"
-    # 总投入不超过 0.5 × 总资产
-    total_value = acct.cash + sum(
-        p.qty * (10 if p.symbol == "000003" else 20) for p in acct.positions.values())
-    invested = total_value - acct.cash
-    assert invested <= total_value * 0.5 + 1e-6
+    positions, cash = paper.replay_positions(tmp_path)
+    assert cash == pytest.approx(1_000_000 - 1000 * 10.005 - fee)
+    assert positions[SYM]["qty"] == 1000
+    assert positions[SYM]["avg_cost"] == pytest.approx((1000 * 10.005 + fee) / 1000)
+    # 台账重放 == 物化持仓 (账务一致性)
+    mat = paper.load_positions(tmp_path)[SYM]
+    assert mat["qty"] == positions[SYM]["qty"]
+    assert mat["avg_cost"] == pytest.approx(positions[SYM]["avg_cost"])
 
 
-def test_exit_signal_sell_time_open():
-    """sell_time=open 时信号离场也按结算日开盘价成交。"""
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        "2026-01-03": {"000001": r("000001", 10.2, 11)},
-        "2026-01-04": {"000001": r("000001", 11.3, 11.0, csg={"csg_out": True})},
-    })
-    acct = make_account()
-    s = make_strategy()
-    s.sell_rule = SellRule(exit_signal_ids=["out"], sell_time="open")
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    process_day(mk, acct, s, "2026-01-03", candidates=[])
-    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
-    sells = [t for t in trades if t.side == "sell"]
-    assert sells[0].reason == "exit_signal"
-    assert sells[0].price == pytest.approx(11.3), "sell_time=open 应按开盘价成交"
+def test_limit_up_buy_rejected(tmp_path, monkeypatch):
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    _cap_account(tmp_path)
+    order, _ = paper.create_order(tmp_path, SYM, "buy", qty=100, ref_price=10.0)
+    # 主板涨停 11.0; 快照 11 + 滑点 ≥ 涨停 → 拒单
+    assert paper.evaluate_intraday(tmp_path, {SYM: 11.0}) == []
+    got = paper.get_order(tmp_path, order["id"])
+    assert got["status"] == "expired"
+    assert "涨停" in got["reason"]
 
 
-def test_sell_rule_rejects_bad_sell_time():
-    with pytest.raises(ValueError):
-        SellRule.from_dict({"sell_time": "noon"})
+def test_limit_down_sell_rejected(tmp_path, monkeypatch):
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    _cap_account(tmp_path)
+    _, err = paper.create_order(tmp_path, SYM, "buy", qty=100, ref_price=10.0)
+    assert err is None
+    paper.evaluate_intraday(tmp_path, {SYM: 10.0})
+    monkeypatch.setattr(paper, "cn_today", lambda: day + timedelta(days=1))
+    paper._materialize(tmp_path)
+    sell, err = paper.create_order(tmp_path, SYM, "sell", qty=100)
+    assert err is None
+    # 跌停 9.0; 快照 9 减滑点后不高于跌停价 -> 拒单
+    assert paper.evaluate_intraday(tmp_path, {SYM: 9.0}) == []
+    got = paper.get_order(tmp_path, sell["id"])
+    assert got["status"] == "expired" and "跌停" in got["reason"]
 
 
-# ── 涨跌停打开买卖 ────────────────────────────────────────
+def test_settle_next_open_close_and_postpone_expire(tmp_path):
+    day = date(2026, 9, 24)
+    _cap_account(tmp_path)
+    _write_daily(tmp_path, [
+        (day - timedelta(days=1), 10.0, 10.0),
+        (day, 10.2, 10.8),  # 涨跌幅内 (±10%): 开 10.2 收 10.8
+    ])
+    no_open, _ = paper.create_order(tmp_path, SYM, "buy", qty=100, order_type="next_open", ref_price=10.0)
+    close_ord, _ = paper.create_order(tmp_path, SYM, "buy", qty=100, order_type="close", ref_price=10.0)
+    summary = paper.settle_day(tmp_path, day.isoformat())
+    assert summary["filled"] == 2
+    assert paper.get_order(tmp_path, no_open["id"])["fill_price"] == pytest.approx(10.2 * 1.0005)
+    assert paper.get_order(tmp_path, close_ord["id"])["fill_price"] == pytest.approx(10.8 * 1.0005)
+
+    # 停牌顺延 → 连续无行情 4 日过期 (MAX_POSTPONE_DAYS=3)
+    stuck, _ = paper.create_order(tmp_path, SYM, "buy", qty=100, order_type="next_open", ref_price=11.0)
+    for i in range(4):
+        s = paper.settle_day(tmp_path, (day + timedelta(days=i + 1)).isoformat())
+    got = paper.get_order(tmp_path, stuck["id"])
+    assert got["status"] == "expired" and "自动过期" in got["reason"]
+    assert s["expired"] >= 1
 
 
-def test_limit_down_open_sell():
-    """开启「跌停打开卖出」: 开盘封跌停、盘中打开(高点>跌停价) → 按跌停价卖出。"""
-    # prev_close 10 → 跌停 9.0; open 9.0 封死, high 9.3 盘中打开
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        # 次日(hold_days=1 触发 max_hold): 开盘跌停但盘中打开
-        "2026-01-03": {"000001": r("000001", 9.0, 9.1, high=9.3, low=8.9,
-                                   prev_close=10.0)},
-    }, limit_down={"000001": 9.0})
-    acct = make_account()
-    s = make_strategy()
-    s.buy_rule.buy_time = "same_open"
-    s.sell_rule = SellRule(max_hold_days=1, sell_time="open",
-                           sell_limit_down_open=True)
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    trades, _ = process_day(mk, acct, s, "2026-01-03", candidates=[])
-    sells = [t for t in trades if t.side == "sell"]
-    assert len(sells) == 1 and sells[0].reason == "max_hold"
-    assert sells[0].price == pytest.approx(9.0), "应按排队价(跌停价)成交, 而非打开后的高价"
-    assert not acct.positions
+def test_pending_sell_occupies_available_quota(tmp_path, monkeypatch):
+    """超卖防护: pending 卖出单占用可卖额度, 第二张超额卖出单在下单时被拒。"""
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    _cap_account(tmp_path)
+    _, err = paper.create_order(tmp_path, SYM, "buy", qty=200, ref_price=10.0)
+    assert err is None
+    assert len(paper.evaluate_intraday(tmp_path, {SYM: 10.0})) == 1
+    # 次日: 可卖 200
+    monkeypatch.setattr(paper, "cn_today", lambda: day + timedelta(days=1))
+    paper._materialize(tmp_path)
+    s1, err = paper.create_order(tmp_path, SYM, "sell", qty=100)
+    assert err is None and s1["status"] == "pending"
+    # 已 pending 100, 再挂 200 超出可卖 200 → 拒 (基础可卖校验或占用检查, 双闸任一)
+    _, err = paper.create_order(tmp_path, SYM, "sell", qty=200)
+    assert err is not None and ("可卖" in err or "占用" in err)
+    # 撤单后额度释放, 可以再挂
+    paper.cancel_order(tmp_path, s1["id"])
+    s2, err = paper.create_order(tmp_path, SYM, "sell", qty=100)
+    assert err is None and s2["status"] == "pending"
 
 
-def test_limit_down_never_opened_no_sell():
-    """未开启或全天封死时不卖: 默认行为保持(开盘跌停当日不卖)。"""
-    # 全天封死: high == open == 跌停 9.0
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        "2026-01-03": {"000001": r("000001", 9.0, 9.0, high=9.0, low=9.0,
-                                   prev_close=10.0)},
-    }, limit_down={"000001": 9.0})
-    acct = make_account()
-    s = make_strategy()
-    s.buy_rule.buy_time = "same_open"
-    s.sell_rule = SellRule(max_hold_days=1, sell_time="open",
-                           sell_limit_down_open=True)
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    trades, _ = process_day(mk, acct, s, "2026-01-03", candidates=[])
-    assert [t for t in trades if t.side == "sell"] == [], "全天封死无法成交, 应继续持有"
-    assert "000001" in acct.positions
-
-    # 选项关闭时即使盘中打开也不卖
-    mk2 = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        "2026-01-03": {"000001": r("000001", 9.0, 9.1, high=9.3, low=8.9,
-                                   prev_close=10.0)},
-    }, limit_down={"000001": 9.0})
-    acct2 = make_account()
-    s2 = make_strategy()
-    s2.buy_rule.buy_time = "same_open"
-    s2.sell_rule = SellRule(max_hold_days=1, sell_time="open")
-    process_day(mk2, acct2, s2, "2026-01-02", candidates=["000001"])
-    trades2, _ = process_day(mk2, acct2, s2, "2026-01-03", candidates=[])
-    assert [t for t in trades2 if t.side == "sell"] == [], "未开启选项不应卖出"
+def test_pending_buy_occupies_cash_at_fill(tmp_path, monkeypatch):
+    """资金占用兜底: 两张 pending 买入, 第一张成交后现金不够第二张 → 第二张拒单留痕。"""
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _write_daily(tmp_path, [
+        (day - timedelta(days=1), 10.0, 10.0),
+        (day, 10.0, 10.0),  # 当日有行情, close 单才会在 settle 撮合
+    ])
+    _cap_account(tmp_path, 10_000.0)  # 只够一张 500 股 x 10 元 + 费用
+    a, _ = paper.create_order(tmp_path, SYM, "buy", qty=500, order_type="close", ref_price=10.0)
+    b, err = paper.create_order(tmp_path, SYM, "buy", qty=500, order_type="close", ref_price=10.0)
+    assert err is None  # 预检按单张各自通过, 由撮合侧 (资金/占用双闸) 兜底
+    paper.settle_day(tmp_path, day.isoformat())
+    assert paper.get_order(tmp_path, a["id"])["status"] == "filled"
+    got_b = paper.get_order(tmp_path, b["id"])
+    # b 必须被拒且留痕: 现金已被 a 消耗, 基础资金校验或占用检查任一拦下都算防线生效
+    assert got_b["status"] == "expired"
+    assert got_b["reason"] is not None
+    # 台账只有一张成交, 现金不透支
+    fills = [f for f in paper.load_fills(tmp_path) if f.get("kind", "fill") == "fill"]
+    assert len(fills) == 1
+    _, cash = paper.replay_positions(tmp_path)
+    assert cash >= 0
 
 
-def test_limit_up_open_buy():
-    """开启「涨停打开买入」: 开盘封涨停、盘中打开(低点<涨停价) → 按涨停价买入。"""
-    # prev_close 10 → 涨停 11.0; open 11.0 封死, low 10.8 盘中打开
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 11.0, 11.2, high=11.3, low=10.8,
-                                   prev_close=10.0)},
-    }, limit_up={"000001": 11.0})
-    acct = make_account(cash=10000)
-    s = make_strategy()
-    s.buy_rule.buy_time = "same_open"
-    s.buy_rule.max_position_pct = 0.5
-    s.buy_rule.buy_limit_up_open = True
-    trades, _ = process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    buys = [t for t in trades if t.side == "buy"]
-    assert len(buys) == 1
-    assert buys[0].price == pytest.approx(11.0), "应按排队价(涨停价)成交"
-
-    # 选项关闭时不买(默认行为)
-    mk2 = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 11.0, 11.2, high=11.3, low=10.8,
-                                   prev_close=10.0)},
-    }, limit_up={"000001": 11.0})
-    acct2 = make_account(cash=10000)
-    s2 = make_strategy()
-    s2.buy_rule.buy_time = "same_open"
-    s2.buy_rule.max_position_pct = 0.5
-    trades2, _ = process_day(mk2, acct2, s2, "2026-01-02", candidates=["000001"])
-    assert [t for t in trades2 if t.side == "buy"] == [], "未开启选项不应买入"
+def test_position_symbol_cap(tmp_path, monkeypatch):
+    """持仓标的数上限: 第 51 只新开仓买入被拒 (加仓已有持仓不受限)。"""
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    _cap_account(tmp_path, 100_000_000.0)
+    # 人为塞满 50 只持仓 (直接写台账, 绕过 100 股 x 价格的资金约束)
+    for i in range(50):
+        paper._append_fill(tmp_path, {
+            "seq": i, "ts": "", "date": (day - timedelta(days=1)).isoformat(),
+            "order_id": f"seed{i}", "symbol": f"{600000 + i:06d}.SH",
+            "asset_type": "stock", "side": "buy", "qty": 100, "price": 1.0, "fee": 1.0,
+            "kind": "fill",
+        })
+    paper._materialize(tmp_path)
+    # 新开仓第 51 只 → 拒
+    _, err = paper.create_order(tmp_path, "601999.SH", "buy", qty=100, ref_price=10.0)
+    assert "上限" in err
+    # 加仓已有持仓 → 放行
+    ok, err = paper.create_order(tmp_path, "600000.SH", "buy", qty=100, ref_price=10.0)
+    assert err is None and ok["status"] == "pending"
 
 
-def test_limit_open_options_require_after_close_settlement():
-    """涨跌停打开买卖需当日完整盘口: 结算时间早于 15:00 的策略加载即报错。"""
-    base = {"id": "strat1", "name": "策略", "account_id": "acc1",
-            "iwencai_query": "query", "simulate_time": "14:30"}
-    bad = dict(base, sell_rule={"sell_limit_down_open": True})
-    with pytest.raises(ValueError, match="盘后"):
-        PaperStrategy.from_dict(bad)
-    bad2 = dict(base, buy_rule={"buy_limit_up_open": True})
-    with pytest.raises(ValueError, match="盘后"):
-        PaperStrategy.from_dict(bad2)
-    # 15:00 及之后允许
-    ok = dict(base, simulate_time="15:00",
-              sell_rule={"sell_limit_down_open": True},
-              buy_rule={"buy_limit_up_open": True})
-    strat = PaperStrategy.from_dict(ok)
-    assert strat.sell_rule.sell_limit_down_open and strat.buy_rule.buy_limit_up_open
+def test_settle_idempotent_no_double_fill(tmp_path):
+    day = date(2026, 9, 24)
+    _cap_account(tmp_path)
+    _write_daily(tmp_path, [(day, 10.0, 10.5)])
+    paper.create_order(tmp_path, SYM, "buy", qty=100, order_type="next_open", ref_price=10.0)
+    paper.settle_day(tmp_path, day.isoformat())
+    paper.settle_day(tmp_path, day.isoformat())  # 重跑同日
+    fills = [f for f in paper.load_fills(tmp_path) if f.get("kind", "fill") == "fill"]
+    assert len(fills) == 1
+    _, cash = paper.replay_positions(tmp_path)
+    assert cash == pytest.approx(1_000_000 - fills[0]["qty"] * fills[0]["price"] - fills[0]["fee"])
 
 
-def test_attach_trade_pnl_replays_average_cost():
-    """流水盈亏回放: 买入累计成本, 卖出按当时平均成本计盈亏; 买入 pnl 为 None。"""
-    trades = [
-        {"symbol": "000001", "side": "buy", "qty": 100, "price": 10.0},
-        {"symbol": "000001", "side": "buy", "qty": 100, "price": 11.0},
-        {"symbol": "000001", "side": "sell", "qty": 200, "price": 11.5},
-        {"symbol": "000002", "side": "buy", "qty": 300, "price": 20.0},
-        {"symbol": "000002", "side": "sell", "qty": 100, "price": 19.0},
-        {"symbol": "000002", "side": "sell", "qty": 500, "price": 21.0},  # 超出回放持仓
+def test_corporate_action_adjusts_position_and_idempotent(tmp_path):
+    day = date(2026, 9, 24)
+    _cap_account(tmp_path)
+    _write_daily(tmp_path, [
+        (day - timedelta(days=1), 10.0, 10.0),
+        (day, 8.0, 8.0),  # 除权后价格
+    ])
+    order, _ = paper.create_order(tmp_path, SYM, "buy", qty=1000, order_type="close", ref_price=10.0)
+    paper.settle_day(tmp_path, (day - timedelta(days=1)).isoformat())
+    assert paper.load_positions(tmp_path)[SYM]["qty"] == 1000
+
+    _write_factor(tmp_path, day, 1.25)
+    paper.settle_day(tmp_path, day.isoformat())
+    pos = paper.load_positions(tmp_path)[SYM]
+    assert pos["qty"] == pytest.approx(1250)
+    # 成本被因子摊薄: 总成本不变 (买入费已摊入), 数量乘 1.25 后 avg_cost 除以 1.25
+    order_after = paper.get_order(tmp_path, order["id"])
+    total_cost = 1000 * order_after["fill_price"] + order_after["fees"]
+    replayed = paper.replay_positions(tmp_path)[0][SYM]
+    assert replayed["avg_cost"] * 1250 == pytest.approx(total_cost, rel=1e-4)
+
+    # 重跑同日: 不二次乘因子
+    paper.settle_day(tmp_path, day.isoformat())
+    assert paper.load_positions(tmp_path)[SYM]["qty"] == pytest.approx(1250)
+    corp = [f for f in paper.load_fills(tmp_path) if f.get("kind") == "corp_action"]
+    assert len(corp) == 1
+
+
+def test_nav_and_overview_math(tmp_path, monkeypatch):
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _cap_account(tmp_path, 100_000.0)
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    _, err = paper.create_order(tmp_path, SYM, "buy", qty=1000, ref_price=10.0)
+    assert err is None
+    paper.evaluate_intraday(tmp_path, {SYM: 10.0})
+    fill = next(f for f in paper.load_fills(tmp_path) if f.get("kind", "fill") == "fill")
+
+    # 盘中估算: 价格 11 → 市值 11000
+    ov = paper.overview(tmp_path, {SYM: 11.0})
+    assert ov["estimating"] is True
+    assert ov["market_value"] == pytest.approx(11000.0)
+    assert ov["cash"] == pytest.approx(100_000 - fill["qty"] * fill["price"] - fill["fee"])
+    assert ov["total"] == pytest.approx(ov["cash"] + ov["market_value"])
+
+    # 定版净值: 收盘价写 nav/daily.jsonl, 同日重写幂等
+    nav = paper.daily_nav(tmp_path, day.isoformat(), {SYM: 10.5})
+    paper._write_nav_line(tmp_path, day.isoformat(), nav)
+    paper._write_nav_line(tmp_path, day.isoformat(), nav)
+    lines = paper.load_nav(tmp_path)
+    assert len(lines) == 1 and lines[0]["nav"] == pytest.approx(nav["nav"])
+
+
+def test_round_trips_fifo_stats(tmp_path):
+    day = date(2026, 9, 1)
+    _cap_account(tmp_path)
+    _write_daily(tmp_path, [(day, 10.0, 10.0), (day + timedelta(days=1), 12.0, 12.0)])
+    # 手工构造台账 (纯统计口径测试, 绕过撮合): 两次买入一次卖出
+    for f in (
+        {"seq": 1, "ts": "", "date": day.isoformat(), "order_id": "o1", "symbol": SYM,
+         "asset_type": "stock", "side": "buy", "qty": 100, "price": 10.0, "fee": 5.0, "kind": "fill"},
+        {"seq": 2, "ts": "", "date": day.isoformat(), "order_id": "o2", "symbol": SYM,
+         "asset_type": "stock", "side": "buy", "qty": 100, "price": 11.0, "fee": 5.0, "kind": "fill"},
+        {"seq": 3, "ts": "", "date": (day + timedelta(days=1)).isoformat(), "order_id": "o3", "symbol": SYM,
+         "asset_type": "stock", "side": "sell", "qty": 150, "price": 12.0, "fee": 5.0 + 18.0, "kind": "fill"},
+    ):
+        paper._append_fill(tmp_path, f)
+    rounds = paper.round_trips(tmp_path)
+    assert len(rounds) == 2
+    # FIFO: 先平 10 元批次 100 股, 再平 11 元批次 50 股
+    assert rounds[0]["qty"] == 100 and rounds[0]["open_date"] == day.isoformat()
+    assert rounds[0]["pnl"] == pytest.approx(12.0 * 100 - (10.0 * 100 + 5.0) - (5.0 + 18.0) * 100 / 150, rel=1e-3)
+    assert rounds[1]["qty"] == 50
+    st = paper.stats(tmp_path)
+    assert st["rounds"] == 2 and st["win_rate"] == 100.0
+
+
+# ── 自动跟单 (V2) ───────────────────────────────────────
+def _auto_rule(**overrides) -> dict:
+    base = {
+        "name": "跟单测试",
+        "match_kind": "strategy",
+        "match_id": "strat_1",
+        "side": "buy",
+        "size_mode": "fixed_amount",
+        "size_value": 5000.0,
+        "order_type": "next_open",
+        "cooldown_days": 5,
+        "enabled": True,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_auto_rule_crud_and_validation(tmp_path):
+    from app.strategy import paper_auto
+    with pytest.raises(ValueError, match="不能为空"):
+        paper_auto.create_auto_rule(tmp_path, _auto_rule(name=""))
+    with pytest.raises(ValueError, match="match_kind"):
+        paper_auto.create_auto_rule(tmp_path, _auto_rule(match_kind="xxx"))
+    with pytest.raises(ValueError, match="不能超过 100"):
+        paper_auto.create_auto_rule(tmp_path, _auto_rule(size_mode="pct_equity", size_value=150))
+    rule = paper_auto.create_auto_rule(tmp_path, _auto_rule())
+    assert rule["id"].startswith("arule_")
+    assert len(paper_auto.load_auto_rules(tmp_path)) == 1
+    paper_auto.set_enabled(tmp_path, rule["id"], False)
+    assert paper_auto.load_auto_rules(tmp_path, enabled_only=True) == []
+    assert paper_auto.delete_auto_rule(tmp_path, rule["id"]) is True
+    assert paper_auto.delete_auto_rule(tmp_path, rule["id"]) is False
+
+
+def test_auto_trigger_matches_strategy_event(tmp_path, monkeypatch):
+    from app.strategy import paper_auto
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    _cap_account(tmp_path)
+    paper_auto.create_auto_rule(tmp_path, _auto_rule())
+
+    ev = {"source": "strategy", "strategy_id": "strat_1", "rule_id": "r1",
+          "symbol": SYM, "price": 10.0}
+    orders = paper_auto.on_rule_events(tmp_path, [ev])
+    assert len(orders) == 1
+    assert orders[0]["qty"] == 500        # 5000 元 / 10 元 → 500 股
+    assert orders[0]["source"].startswith("auto:")
+    assert orders[0]["order_type"] == "next_open"
+
+    # 冷却期内同 symbol 不再触发
+    assert paper_auto.on_rule_events(tmp_path, [ev]) == []
+    # 冷却外 (6 天后) 恢复触发
+    paper_auto._now_iso = lambda: ""  # no-op 防误用提示
+    rule_id = orders[0]["source"].split(":", 1)[1]
+    paper_auto.delete_auto_rule(tmp_path, rule_id) if False else None
+    # 直接改订单 created_at 模拟 6 天前
+    orders_loaded = paper.load_orders(tmp_path)
+    for o in orders_loaded:
+        o["created_at"] = "2026-09-18T10:00:00+08:00"
+        paper.save_order(tmp_path, o)
+    orders2 = paper_auto.on_rule_events(tmp_path, [ev])
+    assert len(orders2) == 1
+
+
+def test_auto_trigger_non_matching_events_ignored(tmp_path):
+    from app.strategy import paper_auto
+    _cap_account(tmp_path)
+    paper_auto.create_auto_rule(tmp_path, _auto_rule())
+    # strategy_id 不匹配
+    ev1 = {"source": "strategy", "strategy_id": "other", "symbol": SYM, "price": 10.0}
+    # 无 symbol (批量事件)
+    ev2 = {"source": "strategy", "strategy_id": "strat_1", "symbol": "", "price": 10.0}
+    # 无价格
+    ev3 = {"source": "strategy", "strategy_id": "strat_1", "symbol": SYM}
+    assert paper_auto.on_rule_events(tmp_path, [ev1, ev2, ev3]) == []
+
+
+def test_auto_rule_disabled_not_triggered(tmp_path):
+    from app.strategy import paper_auto
+    _cap_account(tmp_path)
+    rule = paper_auto.create_auto_rule(tmp_path, _auto_rule(enabled=False))
+    ev = {"source": "strategy", "strategy_id": "strat_1", "symbol": SYM, "price": 10.0}
+    assert paper_auto.on_rule_events(tmp_path, [ev]) == []
+    paper_auto.set_enabled(tmp_path, rule["id"], True)
+    assert len(paper_auto.on_rule_events(tmp_path, [ev])) == 1
+
+
+def test_auto_frozen_account_rejects(tmp_path, monkeypatch):
+    from app.strategy import paper_auto
+    acc = _cap_account(tmp_path)
+    acc["status"] = "frozen"
+    paper.save_account(tmp_path, acc)
+    paper_auto.create_auto_rule(tmp_path, _auto_rule())
+    ev = {"source": "strategy", "strategy_id": "strat_1", "symbol": SYM, "price": 10.0}
+    assert paper_auto.on_rule_events(tmp_path, [ev]) == []
+
+
+def test_max_drawdown_pure():
+    assert paper.max_drawdown([]) is None
+    assert paper.max_drawdown([100]) == 0.0
+    assert paper.max_drawdown([100, 110, 99, 105]) == pytest.approx(0.1)
+    assert paper.max_drawdown([100, 120, 60, 90]) == pytest.approx(0.5)
+    assert paper.max_drawdown([100, 100, 100]) == 0.0
+
+
+# ── 涨跌停排队 (V2: queue_limit_orders) ─────────────────
+def test_limit_queue_default_off_rejects_immediately(tmp_path, monkeypatch):
+    """默认关闭: 触及涨停直接过期 (与 V1 行为一致, 由 test_limit_up_buy_rejected 锁定)。"""
+    acc = _cap_account(tmp_path)
+    assert acc["queue_limit_orders"] is False
+
+
+def test_limit_queue_retries_next_open_then_expires(tmp_path, monkeypatch):
+    """排队开启: 涨停买不进 → 转 next_open 次日重试, 连续涨停计顺延, 超限过期。"""
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    # 盘中 10:00 下单并排队: 当日开盘价在排队前已打印, 当日结算不成交, 从次日开盘起重试
+    monkeypatch.setattr(paper, "cn_now", lambda: datetime.combine(day, time(10, 0), tzinfo=CN_TZ))
+    paper.create_account(tmp_path, 1_000_000, queue_limit_orders=True)
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    order, _ = paper.create_order(tmp_path, SYM, "buy", qty=100, ref_price=10.0)
+
+    # day1 盘中触及涨停 11.0 → 不再过期, 转 next_open 排队
+    assert paper.evaluate_intraday(tmp_path, {SYM: 11.0}) == []
+    got = paper.get_order(tmp_path, order["id"])
+    assert got["status"] == "pending" and got["order_type"] == "next_open"
+    assert got["postponed"] == 1 and "排队" in got["reason"]
+
+    # day2..day4 开盘连续一字涨停 (open == 涨停价) → 顺延到 3, 第 4 次超限过期
+    _write_daily(tmp_path, [
+        (day, 12.10, 12.10),              # day1 收盘 (排队当日, 结算跳过)
+        (day + timedelta(days=1), 13.31, 13.31),   # vs 12.10 涨停 13.31
+        (day + timedelta(days=2), 14.64, 14.64),   # vs 13.31 涨停 14.64
+        (day + timedelta(days=3), 16.10, 16.10),   # vs 14.64 涨停 16.10 → 第 4 次
+    ])
+    for i in range(4):
+        paper.settle_day(tmp_path, (day + timedelta(days=i)).isoformat())
+    got = paper.get_order(tmp_path, order["id"])
+    assert got["status"] == "expired" and "排队" in got["reason"]
+    assert got["postponed"] == paper.MAX_POSTPONE_DAYS
+
+
+def test_limit_queue_fills_when_open_below_limit(tmp_path, monkeypatch):
+    """排队开启后次日开盘回落 → 按 next_open 正常成交。"""
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    monkeypatch.setattr(paper, "cn_now", lambda: datetime.combine(day, time(10, 0), tzinfo=CN_TZ))
+    paper.create_account(tmp_path, 1_000_000, queue_limit_orders=True)
+    _write_daily(tmp_path, [
+        (day - timedelta(days=1), 10.0, 10.0),
+        (day, 10.6, 11.0),                        # 排队当日 (盘中触及涨停 11.0)
+        (day + timedelta(days=1), 10.5, 10.9),    # 次日开盘 10.5 未涨停
+    ])
+    order, _ = paper.create_order(tmp_path, SYM, "buy", qty=100, ref_price=10.0)
+    assert paper.evaluate_intraday(tmp_path, {SYM: 11.0}) == []  # 涨停排队
+    assert paper.get_order(tmp_path, order["id"])["status"] == "pending"
+    assert paper.settle_day(tmp_path, day.isoformat())["filled"] == 0  # 当日开盘价在排队前已打印
+    summary = paper.settle_day(tmp_path, (day + timedelta(days=1)).isoformat())
+    assert summary["filled"] == 1
+    got = paper.get_order(tmp_path, order["id"])
+    assert got["status"] == "filled" and got["fill_price"] == pytest.approx(paper.apply_slippage(10.5, "buy", 5.0))
+
+
+# ── 多账户 (V2) ─────────────────────────────────────────
+def test_multi_account_isolation(tmp_path, monkeypatch):
+    """两账户完全隔离: 订单/持仓/现金/统计互不可见。"""
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    paper.create_account(tmp_path, 1_000_000, account_id="default", name="主账户")
+    paper.create_account(tmp_path, 500_000, account_id="acc_a", name="策略A")
+
+    # 同一标的分别在两个账户各买一笔
+    assert paper.evaluate_intraday(tmp_path, {SYM: 10.0}, account_id="default") == []  # 无订单
+    o1, err = paper.create_order(tmp_path, SYM, "buy", qty=100, account_id="default")
+    o2, err = paper.create_order(tmp_path, SYM, "buy", qty=200, account_id="acc_a")
+    assert err is None
+    assert len(paper.evaluate_intraday(tmp_path, {SYM: 10.0}, account_id="default")) == 1
+    assert len(paper.evaluate_intraday(tmp_path, {SYM: 10.0}, account_id="acc_a")) == 1
+
+    # 订单互不可见
+    assert [o["id"] for o in paper.load_orders(tmp_path, "default")] == [o1["id"]]
+    assert [o["id"] for o in paper.load_orders(tmp_path, "acc_a")] == [o2["id"]]
+    # 持仓互不可见
+    assert paper.load_positions(tmp_path, "default")[SYM]["qty"] == 100
+    assert paper.load_positions(tmp_path, "acc_a")[SYM]["qty"] == 200
+    # 现金互不可见 (含费用扣减不同)
+    ov1 = paper.overview(tmp_path, account_id="default")
+    ov2 = paper.overview(tmp_path, account_id="acc_a")
+    assert ov1["cash"] > ov2["cash"]
+    assert ov1["account_name"] == "主账户" and ov2["account_name"] == "策略A"
+
+    # 账户列表与遍历
+    assert paper.list_account_ids(tmp_path) == ["default", "acc_a"]
+    infos = {a["id"]: a for a in paper.list_accounts(tmp_path)}
+    assert set(infos) == {"default", "acc_a"} and infos["acc_a"]["name"] == "策略A"
+
+    # settings 只影响目标账户
+    paper.update_settings(tmp_path, "acc_a", queue_limit_orders=True)
+    assert paper.get_account(tmp_path, "default")["queue_limit_orders"] is False
+    assert paper.get_account(tmp_path, "acc_a")["queue_limit_orders"] is True
+
+    # 净值隔离
+    paper.settle_day(tmp_path, day.isoformat(), account_id="default")
+    paper.settle_day(tmp_path, day.isoformat(), account_id="acc_a")
+    nav1 = paper.load_nav(tmp_path, "default")
+    nav2 = paper.load_nav(tmp_path, "acc_a")
+    assert len(nav1) == 1 and len(nav2) == 1 and nav1[0]["nav"] != nav2[0]["nav"]
+
+
+def test_account_id_validation_blocks_traversal(tmp_path):
+    import pytest as _pytest
+    for bad in ("../evil", "a/b", "", "x" * 33, "a b"):
+        with _pytest.raises(ValueError):
+            paper.get_account(tmp_path, bad)
+        with _pytest.raises(ValueError):
+            paper.create_account(tmp_path, 100.0, account_id=bad)
+
+
+def test_legacy_single_account_layout_migrates(tmp_path, monkeypatch):
+    """旧版 data/paper/* 单账户布局首次访问自动迁移到 accounts/default/。"""
+    monkeypatch.setattr(paper, "_MIGRATION_DONE", False)
+    legacy = tmp_path / "paper"
+    legacy.mkdir()
+    (legacy / "account.json").write_text(
+        __import__("json").dumps({
+            "id": "default", "initial_cash": 800000.0, "cash": 750000.0,
+            "commission_pct": 0.00025, "stamp_tax_pct": 0.001, "slippage_bps": 5.0,
+            "status": "active", "created_at": "2026-09-01T10:00:00",
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (legacy / "orders").mkdir()
+    (legacy / "orders" / "order_x.json").write_text("{}", encoding="utf-8")
+
+    acc = paper.get_account(tmp_path)
+    assert acc is not None and acc["cash"] == 750000.0
+    # 物理迁移到位
+    assert (tmp_path / "paper" / "accounts" / "default" / "account.json").exists()
+    assert (tmp_path / "paper" / "accounts" / "default" / "orders" / "order_x.json").exists()
+    assert not (legacy / "account.json").exists()
+    # 幂等: 重复访问不报错
+    assert paper.get_account(tmp_path)["cash"] == 750000.0
+
+
+# ── V3 补全: 结算成交留痕 / 自动跟单下单事件 ──────────
+def test_day_fill_events_returns_todays_fills(tmp_path, monkeypatch):
+    """day_fill_events: 只取指定交易日、kind=fill 的台账行, 转 AlertEvent 同构事件。"""
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    _cap_account(tmp_path)
+
+    # 当日无成交 → 空列表
+    assert paper.day_fill_events(tmp_path, day.isoformat()) == []
+
+    _, err = paper.create_order(tmp_path, SYM, "buy", qty=1000, ref_price=10.0)
+    assert err is None
+    assert len(paper.evaluate_intraday(tmp_path, {SYM: 10.0})) == 1
+
+    events = paper.day_fill_events(tmp_path, day.isoformat())
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["source"] == "paper" and ev["type"] == "fill" and ev["severity"] == "info"
+    assert ev["symbol"] == SYM and ev["side"] == "buy" and ev["qty"] == 1000
+    assert isinstance(ev["ts"], int) and ev["ts"] > 0
+    assert "买入成交" in ev["message"]
+    # 幂等 (结算重跑同日不重复追加事件)
+    assert paper.day_fill_events(tmp_path, day.isoformat()) == events
+
+
+def test_auto_order_events_shape(tmp_path):
+    """auto_order_events: 订单 → AlertEvent 同构事件, rule_id 从 source 还原。"""
+    from app.strategy import paper_auto
+
+    orders = [
+        {"symbol": "600000.SH", "side": "buy", "qty": 500,
+         "order_type": "next_open", "source": "auto:rule_abc"},
+        {"symbol": "000001.SZ", "side": "sell", "qty": 200,
+         "order_type": "market", "source": "manual"},
     ]
-    attach_trade_pnl(trades)
-    assert trades[0]["pnl"] is None and trades[1]["pnl"] is None
-    assert trades[2]["pnl"] == pytest.approx(200.0), "(11.5-10.5)×200"
-    assert trades[2]["pnl_pct"] == pytest.approx(9.52), "(11.5-10.5)/10.5"
-    assert trades[3]["pnl"] is None
-    assert trades[4]["pnl"] == pytest.approx(-100.0), "(19-20)×100"
-    assert trades[4]["pnl_pct"] == pytest.approx(-5.0), "(19-20)/20"
-    assert trades[5]["pnl"] is None, "卖出超出回放持仓时应为 None"
-    assert trades[5]["pnl_pct"] is None
-
-
-def test_replay_account_recomputes_hold_days():
-    """删除交易后的账户回放: 重建现金/持仓/均价, 并按已结算日重算 hold_days。
-
-    回归场景: dde_01 删除一笔卖出后回放把 hold_days 清零, 导致
-    max_hold_days=1 的持仓次日不卖出（晚一个交易日）。
-    """
-    acc = make_account()
-    acc.last_record_date = "2026-09-16"
-    trades = [
-        {"symbol": "000978.SZ", "side": "buy", "qty": 300, "price": 10.33,
-         "date": "2026-09-14"},
-        {"symbol": "000978.SZ", "side": "buy", "qty": 300, "price": 11.56,
-         "date": "2026-09-15"},
-        {"symbol": "000978.SZ", "side": "sell", "qty": 300, "price": 11.56,
-         "date": "2026-09-15"},
-        {"symbol": "001896.SZ", "side": "buy", "qty": 200, "price": 13.45,
-         "date": "2026-09-15"},
-    ]
-    replay_account(acc, trades, ["2026-09-14", "2026-09-15", "2026-09-16"])
-    p = acc.positions["000978.SZ"]
-    assert p.qty == 300 and p.entry_date == "2026-09-14"
-    assert p.avg_cost == pytest.approx(10.945), "两笔买入摊薄 (10.33+11.56)/2"
-    assert p.hold_days == 3, "09-14 建仓, 经历 09-14/15/16 三个结算日"
-    assert acc.positions["001896.SZ"].hold_days == 2, "09-15 建仓, 经历两个结算日"
-    assert acc.cash == pytest.approx(100000 - 10.33 * 300 - 11.56 * 300
-                                     - 13.45 * 200 + 11.56 * 300)
-    # 无已结算日（last_record_date 为空）时 hold_days 归零
-    acc2 = make_account()
-    replay_account(acc2, trades[:1], ["2026-09-14"])
-    assert acc2.positions["000978.SZ"].hold_days == 0, "无 last_record_date 时为 0"
-
-
-# ── sell_time=next_open（次日开盘价卖出） ────────────────
-
-
-def test_sell_time_next_open_queues_and_fills_next_open():
-    """触发日只登记待卖单，次日以开盘价成交。"""
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        "2026-01-03": {"000001": r("000001", 10.2, 11)},    # hold_days=1 触发 max_hold=1
-        "2026-01-04": {"000001": r("000001", 10.5, 11.2)},  # 次日开盘成交
-    })
-    acct = make_account()
-    s = make_strategy()
-    s.buy_rule.buy_time = "same_open"
-    s.sell_rule = SellRule(max_hold_days=1, sell_time="next_open")
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    trades, _ = process_day(mk, acct, s, "2026-01-03", candidates=[])
-    assert [t for t in trades if t.side == "sell"] == [], "触发日不卖出"
-    assert len(acct.pending_sells) == 1
-    assert acct.pending_sells[0].reason == "max_hold"
-    assert "000001" in acct.positions
-    trades2, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
-    sells = [t for t in trades2 if t.side == "sell"]
-    assert len(sells) == 1 and sells[0].reason == "max_hold"
-    assert sells[0].price == pytest.approx(10.5), "次日开盘价成交"
-    assert not acct.positions and not acct.pending_sells
-
-
-def test_pending_sell_defers_when_open_limit_down():
-    """待卖单成交日开盘封跌停 → 顺延到下一可卖日。"""
-    mk = FakeMarket({
-        "2026-01-02": {"000001": r("000001", 10, 10)},
-        "2026-01-03": {"000001": r("000001", 10.2, 11)},   # 触发, 登记待卖单
-        "2026-01-04": {"000001": r("000001", 9.0, 9.0, prev_close=10.0)},  # 开盘跌停
-        "2026-01-05": {"000001": r("000001", 9.5, 9.8)},   # 顺延成交
-    }, limit_down={"000001": 9.0})
-    acct = make_account()
-    s = make_strategy()
-    s.buy_rule.buy_time = "same_open"
-    s.sell_rule = SellRule(max_hold_days=1, sell_time="next_open")
-    process_day(mk, acct, s, "2026-01-02", candidates=["000001"])
-    process_day(mk, acct, s, "2026-01-03", candidates=[])
-    trades, _ = process_day(mk, acct, s, "2026-01-04", candidates=[])
-    assert [t for t in trades if t.side == "sell"] == [], "跌停日顺延不成交"
-    assert "000001" in acct.positions and len(acct.pending_sells) == 1
-    trades2, _ = process_day(mk, acct, s, "2026-01-05", candidates=[])
-    sells = [t for t in trades2 if t.side == "sell"]
-    assert len(sells) == 1 and sells[0].price == pytest.approx(9.5)
-    assert not acct.positions and not acct.pending_sells
-
-
-# ── 账户/策略落盘并发安全（dde_02/dde_03 账户丢失回归） ──────────
-
-
-def test_load_accounts_raises_on_corrupt_file(tmp_path):
-    """accounts.json 被截断/损坏时必须报错，绝不返回 {}。
-
-    历史 bug：返回空字典后调用方 save_accounts 会把整份文件覆盖成空，
-    并发结算时其他账户被静默抹掉。这里同时断言报错不会进一步改写文件。
-    """
-    store = PaperStore(tmp_path)
-    store.save_accounts({"acc1": Account.create("acc1", "测试账户", 100000.0)})
-    acct_file = tmp_path / "paper" / "accounts.json"
-    acct_file.write_text('{"broken": ', encoding="utf-8")
-    with pytest.raises(RuntimeError):
-        store.load_accounts()
-    assert acct_file.read_text(encoding="utf-8") == '{"broken": '
-
-
-def test_load_strategies_raises_on_corrupt_file(tmp_path):
-    store = PaperStore(tmp_path)
-    store.save_strategies({"s1": PaperStrategy.create("s1", "策略", "acc1", "query")})
-    strat_file = tmp_path / "paper" / "strategies.json"
-    strat_file.write_text("", encoding="utf-8")
-    with pytest.raises(RuntimeError):
-        store.load_strategies()
-
-
-def test_save_accounts_is_atomic(tmp_path):
-    """保存走临时文件 + 原子替换：不残留 .tmp，内容完整可解析。"""
-    store = PaperStore(tmp_path)
-    store.save_accounts({"acc1": Account.create("acc1", "a", 100000.0),
-                         "acc2": Account.create("acc2", "b", 100000.0)})
-    names = [p.name for p in (tmp_path / "paper").iterdir()]
-    assert "accounts.json" in names
-    assert not any(n.endswith(".tmp") for n in names)
-    assert set(store.load_accounts()) == {"acc1", "acc2"}
-
-
-def test_concurrent_persist_account_keeps_all(tmp_path):
-    """三个线程反复并发落盘各自账户（模拟多策略同一时刻结算）后三个都在。"""
-    import threading
-
-    from app.paper.service import _persist_account
-
-    store = PaperStore(tmp_path)
-    store.save_accounts({})
-    accs = [Account.create(f"acc{i}", f"账户{i}", 100000.0) for i in range(3)]
-
-    def worker(acc: Account) -> None:
-        for _ in range(30):
-            _persist_account(store, acc)
-
-    threads = [threading.Thread(target=worker, args=(a,)) for a in accs]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    assert set(store.load_accounts()) == {"acc0", "acc1", "acc2"}
+    events = paper_auto.auto_order_events(orders, account_id="acc1")
+    assert len(events) == 2
+    buy_ev, sell_ev = events
+    assert buy_ev["source"] == "paper" and buy_ev["type"] == "auto_order"
+    assert buy_ev["rule_id"] == "rule_abc" and buy_ev["account_id"] == "acc1"
+    assert "买入" in buy_ev["message"] and "次日开盘" in buy_ev["message"] and "500股" in buy_ev["message"]
+    assert isinstance(buy_ev["ts"], int) and buy_ev["ts"] > 0
+    assert sell_ev["rule_id"] == "" and "卖出" in sell_ev["message"] and "即时" in sell_ev["message"]
+    # 空列表 → 空
+    assert paper_auto.auto_order_events([]) == []

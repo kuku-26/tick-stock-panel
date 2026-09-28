@@ -1,212 +1,168 @@
-# -*- coding: utf-8 -*-
-"""问财实盘模拟 — 账户更新 / 手动交易 API 测试（直接调用端点函数 + 注入临时 store）。"""
+"""虚拟账户 API 契约测试 — 成功/无数据/错误响应 (per CONTRIBUTING API 契约矩阵)。
+
+镜像 test_alerts_query_bounds.py: 只挂本路由的裸 FastAPI app, 不经过主应用
+全局中间件 (访问密码门是部署层关注点, 不属于本契约)。
+"""
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
-from app.paper import context
-from app.paper.api import (AccountUpdateModel, ManualTradeModel,
-                           account_detail, daily_records, manual_trade,
-                           update_account)
-from app.paper.market import DayRow
-from app.paper.models import Account, DaySnapshot, PaperStrategy, TradeRecord
-from app.paper.store import PaperStore
+from app.api.paper import router
 
 
-def _seed(tmp_path) -> PaperStore:
-    store = PaperStore(tmp_path)
-    context.set_instances(store, None, None)
-    store.save_accounts({"acc1": Account.create("acc1", "测试账户", 100000.0)})
-    store.save_strategies({"s1": PaperStrategy.create("s1", "策略", "acc1", "query")})
-    return store
+@pytest.fixture
+def client(tmp_path: Path) -> TestClient:
+    app = FastAPI()
+    app.include_router(router)
+    app.state.repo = SimpleNamespace(
+        store=SimpleNamespace(data_dir=tmp_path),
+        resolve_asset_type=lambda s: "etf" if s.split(".")[0].startswith(("51", "56", "58", "15")) else "stock",
+    )
+    return TestClient(app)
 
 
-def test_update_account_renames_and_changes_initial_cash(tmp_path):
-    _seed(tmp_path)
-    update_account("acc1", AccountUpdateModel(name=" 新名字 ", initial_cash=50000.0), None)
-    acc = context.get_store().load_accounts()["acc1"]
-    assert acc.name == "新名字"
-    assert acc.initial_cash == 50000.0
-    # 初始资金变更不影响当前可用现金
-    assert acc.cash == 100000.0
-
-    with pytest.raises(Exception):
-        update_account("acc1", AccountUpdateModel(name="x", initial_cash=0), None)
+def test_overview_before_init(client: TestClient):
+    r = client.get("/api/paper/overview")
+    assert r.status_code == 200
+    assert r.json() == {"initialized": False, "account_id": "default"}
 
 
-def test_manual_buy_and_sell(tmp_path):
-    store = _seed(tmp_path)
-    manual_trade("acc1", ManualTradeModel(symbol="600000.SH", side="buy", qty=100, price=10.0), None)
-    acc = store.load_accounts()["acc1"]
-    assert acc.positions["600000.SH"].qty == 100
-    assert acc.positions["600000.SH"].avg_cost == 10.0
-    assert round(acc.cash, 2) == 99000  # 100000 - 100*10
-    # 手数限制：须为 100 的整倍
-    with pytest.raises(Exception):
-        manual_trade("acc1", ManualTradeModel(symbol="600000.SH", side="buy", qty=150, price=1.0), None)
+def test_multi_account_isolation_and_settings(client: TestClient):
+    """双账户隔离: 订单/概览互不可见; settings 端点切换涨跌停排队。"""
+    client.post("/api/paper/account", json={"initial_cash": 1000000})  # default
+    r = client.post("/api/paper/account", json={"initial_cash": 500000, "account_id": "acc_a", "name": "策略A"})
+    assert r.status_code == 200 and r.json()["account"]["name"] == "策略A"
 
-    # 全部平仓卖出
-    manual_trade("acc1", ManualTradeModel(symbol="600000.SH", side="sell", qty=100, price=11.0), None)
-    acc = store.load_accounts()["acc1"]
-    assert "600000.SH" not in acc.positions
-    assert round(acc.cash, 2) == 99000 + 100 * 11.0
+    # 账户列表
+    ids = {a["id"] for a in client.get("/api/paper/accounts").json()["accounts"]}
+    assert ids == {"default", "acc_a"}
 
-    # 已无持仓再卖出 → 报错
-    with pytest.raises(Exception):
-        manual_trade("acc1", ManualTradeModel(symbol="600000.SH", side="sell", qty=100, price=11.0), None)
+    # 订单隔离: 同一笔下单只出现在对应账户
+    assert client.post("/api/paper/orders?account=acc_a", json={"symbol": "600519.SH", "side": "buy", "qty": 100, "ref_price": 1500.0}).status_code == 200
+    assert len(client.get("/api/paper/orders?account=acc_a").json()["orders"]) == 1
+    assert len(client.get("/api/paper/orders").json()["orders"]) == 0
 
+    # 概览隔离: acc_a 有 pending 单不影响 default 的现金展示
+    assert client.get("/api/paper/overview?account=acc_a").json()["initial_cash"] == 500000
+    assert client.get("/api/paper/overview").json()["initial_cash"] == 1000000
 
-def test_manual_trade_appends_record_to_bound_strategy(tmp_path):
-    store = _seed(tmp_path)
-    manual_trade("acc1", ManualTradeModel(symbol="600000.SH", side="buy", qty=100, price=10.0), None)
-    trades = store.load_trades("s1")
-    assert len(trades) == 1
-    assert trades[0]["reason"] == "manual"
-    assert trades[0]["symbol"] == "600000.SH"
-    assert trades[0]["side"] == "buy"
+    # settings: 开启涨跌停排队 → 账户字段更新
+    r = client.post("/api/paper/settings?account=acc_a", json={"queue_limit_orders": True})
+    assert r.status_code == 200 and r.json()["account"]["queue_limit_orders"] is True
+    assert client.get("/api/paper/overview?account=acc_a").json()["queue_limit_orders"] is True
+    assert client.get("/api/paper/overview").json()["queue_limit_orders"] is False
+
+    # 非法账户 id → 400 (路径穿越防护)
+    assert client.get("/api/paper/overview?account=../x").status_code == 400
 
 
-def test_manual_buy_backfilled_date_recomputes_hold_days(tmp_path):
-    """手动补录历史日期的买入应视同该日建仓重算 hold_days（与引擎/回放同口径）。
-
-    回归场景: dde_01 手动补录 09-16 买入 000993 后 hold_days=0，导致
-    max_hold_days=1 的持仓次日结算不卖出（晚一个交易日）。
-    """
-    store = _seed(tmp_path)
-    acc = store.load_accounts()["acc1"]
-    acc.last_record_date = "2026-09-16"
-    store.save_accounts({"acc1": acc})
-    for d in ("2026-09-15", "2026-09-16"):
-        store.save_day(DaySnapshot("acc1", "s1", d, 100000.0, {}, 0.0, 100000.0, 1.0))
-
-    # 补录 09-15 的买入: 经历 09-15/16 两个结算日 → hold_days=2
-    manual_trade("acc1", ManualTradeModel(symbol="600000.SH", side="buy",
-                                          qty=100, price=10.0, date="2026-09-15"), None)
-    pos = store.load_accounts()["acc1"].positions["600000.SH"]
-    assert pos.entry_date == "2026-09-15"
-    assert pos.hold_days == 2, "09-15 建仓, 经历 09-15/16 两个结算日"
-
-    # 补录日期晚于最后结算日（未结算）→ hold_days=0, 待当日结算后 +1
-    manual_trade("acc1", ManualTradeModel(symbol="000001.SZ", side="buy",
-                                          qty=100, price=10.0, date="2026-09-17"), None)
-    pos2 = store.load_accounts()["acc1"].positions["000001.SZ"]
-    assert pos2.hold_days == 0, "买入日期晚于最后结算日时为 0"
-
-    # 加仓已有持仓不改变原 entry_date 与 hold_days
-    manual_trade("acc1", ManualTradeModel(symbol="600000.SH", side="buy",
-                                          qty=100, price=11.0, date="2026-09-16"), None)
-    pos3 = store.load_accounts()["acc1"].positions["600000.SH"]
-    assert pos3.qty == 200 and pos3.entry_date == "2026-09-15"
-    assert pos3.hold_days == 2
+def test_account_create_idempotent(client: TestClient):
+    r1 = client.post("/api/paper/account", json={"initial_cash": 500000})
+    assert r1.status_code == 200
+    r2 = client.post("/api/paper/account", json={"initial_cash": 900000})
+    assert r2.status_code == 200
+    assert r2.json()["account"]["cash"] == 500000  # 幂等: 不覆盖
 
 
-def test_daily_records_aggregates_fetch_and_settlement(tmp_path):
-    """/records 按日汇总各策略的选股名单与结算记录；未落盘项显式标记。"""
-    store = _seed(tmp_path)
-    d = "2026-09-18"
-    store.save_iwencai_snapshot(d, "s1", {
-        "strategy_id": "s1", "symbols": ["000001"], "count": 1,
-        "fields": {"000001": {"name": "平安银行"}},
+def test_account_rejects_non_positive_cash(client: TestClient):
+    assert client.post("/api/paper/account", json={"initial_cash": 0}).status_code == 400
+    assert client.post("/api/paper/account", json={"initial_cash": -1}).status_code == 400
+
+
+def test_order_create_list_cancel_flow(client: TestClient):
+    client.post("/api/paper/account", json={"initial_cash": 1000000})
+    r = client.post("/api/paper/orders", json={"symbol": "600519.SH", "side": "buy", "qty": 100, "ref_price": 1500.0})
+    assert r.status_code == 200
+    order = r.json()["order"]
+    assert order["status"] == "pending"
+
+    # 非百股整数倍 → 400
+    assert client.post("/api/paper/orders", json={"symbol": "600519.SH", "side": "buy", "qty": 150}).status_code == 400
+    # 超资金 → 400
+    assert client.post("/api/paper/orders", json={"symbol": "600519.SH", "side": "buy", "qty": 100000, "ref_price": 1500.0}).status_code == 400
+    # 卖出无持仓 → 400
+    assert client.post("/api/paper/orders", json={"symbol": "600519.SH", "side": "sell", "qty": 100}).status_code == 400
+
+    # 列表 + 撤单
+    assert len(client.get("/api/paper/orders?status=pending").json()["orders"]) == 1
+    r = client.delete(f"/api/paper/orders/{order['id']}")
+    assert r.status_code == 200 and r.json()["order"]["status"] == "cancelled"
+    # 已撤不可再撤
+    assert client.delete(f"/api/paper/orders/{order['id']}").status_code == 400
+
+
+def test_order_amount_mode_auto_converts(client: TestClient):
+    client.post("/api/paper/account", json={"initial_cash": 1000000})
+    r = client.post("/api/paper/orders", json={"symbol": "600519.SH", "side": "buy", "amount": 200000, "ref_price": 1500.0})
+    assert r.status_code == 200
+    assert r.json()["order"]["qty"] == 100  # 20万 / 1500 = 133 股 → 向下取整百 = 100
+    # 无参考价的金额单 → 400
+    assert client.post("/api/paper/orders", json={"symbol": "600519.SH", "side": "buy", "amount": 100}).status_code == 400
+
+
+def test_freeze_blocks_new_orders(client: TestClient):
+    client.post("/api/paper/account", json={"initial_cash": 100000})
+    assert client.post("/api/paper/freeze?frozen=true").status_code == 200
+    r = client.post("/api/paper/orders", json={"symbol": "600519.SH", "side": "buy", "qty": 100, "ref_price": 10.0})
+    assert r.status_code == 400 and "冻结" in r.json()["detail"]
+    # 解冻恢复
+    assert client.post("/api/paper/freeze?frozen=false").status_code == 200
+    assert client.post("/api/paper/orders", json={"symbol": "600519.SH", "side": "buy", "qty": 100, "ref_price": 10.0}).status_code == 200
+
+
+def test_freeze_before_init_rejected(client: TestClient):
+    assert client.post("/api/paper/freeze?frozen=true").status_code == 400
+
+
+def test_trades_nav_stats_empty(client: TestClient):
+    client.post("/api/paper/account", json={"initial_cash": 100000})
+    assert client.get("/api/paper/trades").json() == {"fills": []}
+    assert client.get("/api/paper/nav").json() == {"nav": []}
+    stats = client.get("/api/paper/stats").json()
+    assert stats["rounds"] == 0 and stats["win_rate"] == 0.0
+
+
+def test_settings_updates_fees(client: TestClient):
+    """费用三参数可经 settings 端点调整; 超范围 → 400; 未知字段忽略。"""
+    client.post("/api/paper/account", json={"initial_cash": 1000000})
+    r = client.post("/api/paper/settings", json={
+        "commission_pct": 0.0003, "stamp_tax_pct": 0.0005, "slippage_bps": 8,
     })
-    store.save_day(DaySnapshot("acc1", "s1", d, 99000.0, {}, 1000.0, 100000.0, 1.0,
-                               trades=[TradeRecord("t1", "acc1", "s1", d, "000001.SZ",
-                                                   "buy", 100, 10.0, 1000.0, "entry_fill")]))
-
-    out = daily_records(None, d)
-    assert out["date"] == d
-    rec = out["records"][0]
-    assert rec["strategy_id"] == "s1" and rec["name"] == "策略"
-    # 选股：已落盘 + 名称映射
-    assert rec["fetch"]["done"] is True
-    assert rec["fetch"]["count"] == 1
-    assert rec["fetch"]["symbols"][0] == {"symbol": "000001", "name": "平安银行"}
-    # 结算：日快照存在，成交明细透传
-    assert rec["settle"] is not None
-    assert rec["settle"]["total_value"] == 100000.0
-    assert rec["settle"]["trades"][0]["reason"] == "entry_fill"
-
-    # 无任何落盘的日期：done=False / settle=None
-    empty = daily_records(None, "2026-09-19")["records"][0]
-    assert empty["fetch"]["done"] is False and empty["settle"] is None
+    assert r.status_code == 200
+    acc = r.json()["account"]
+    assert acc["commission_pct"] == 0.0003
+    assert acc["stamp_tax_pct"] == 0.0005
+    assert acc["slippage_bps"] == 8
+    # 超范围
+    r = client.post("/api/paper/settings", json={"commission_pct": 0.5})
+    assert r.status_code == 400 and "超出合理范围" in r.json()["detail"]
+    # 部分更新: 只改滑点, 佣金不动
+    r = client.post("/api/paper/settings", json={"slippage_bps": 3})
+    acc = r.json()["account"]
+    assert acc["slippage_bps"] == 3 and acc["commission_pct"] == 0.0003
 
 
-def test_settle_now_guards(tmp_path):
-    """手动结算防重入与行情未就绪保护。"""
-    from datetime import date as _date
+def test_compare_accounts(client: TestClient):
+    """/compare: 逐账户概览+统计+净值; 未初始化的空壳账户不出现。"""
+    # 只有懒创建的空壳目录时 → 空列表
+    assert client.get("/api/paper/compare").json()["accounts"] == []
 
-    from fastapi import HTTPException
-
-    from app.paper.api import settle_now
-    from app.paper.market import MarketData
-
-    store = _seed(tmp_path)
-    context.set_instances(store, MarketData(tmp_path), None)
-
-    # 行情未就绪（空行情目录）→ 503
-    with pytest.raises(HTTPException) as ei:
-        settle_now("s1", None)
-    assert ei.value.status_code == 503
-
-    # 当日已结算 → 409 拒绝重复结算
-    d = _date.today().isoformat()
-    store.save_day(DaySnapshot("acc1", "s1", d, 100000.0, {}, 0.0, 100000.0, 1.0))
-    with pytest.raises(HTTPException) as ei:
-        settle_now("s1", None)
-    assert ei.value.status_code == 409
-
-
-# ── 账户详情：持仓名称/现价/收益率与流水名称 ──────────────
-
-
-class _FakeRepo:
-    def get_name_map(self, symbols=None):
-        return {"600000.SH": "浦发银行"}
-
-
-class _FakeMarket:
-    def latest_date(self):
-        return "2026-01-02"
-
-    def day_rows(self, date, signal_ids=None):
-        return {"600000.SH": DayRow(symbol="600000.SH", open=10.0,
-                                    close=12.0, volume=1000)}
-
-
-def test_account_detail_names_and_pnl(tmp_path):
-    """持仓/流水应带名称, 持仓带最新价与收益率(相对成本价)。"""
-    store = _seed(tmp_path)
-    manual_trade("acc1", ManualTradeModel(symbol="600000.SH", side="buy",
-                                          qty=100, price=10.0), None)
-    context.set_instances(store, _FakeMarket(), None)
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
-        store=store, repo=_FakeRepo())))
-    detail = account_detail("acc1", request)
-    pos = detail["positions"][0]
-    assert pos["name"] == "浦发银行"
-    assert pos["last_price"] == 12.0
-    assert pos["pnl_pct"] == 20.0  # (12-10)/10*100
-    assert detail["trades"][0]["name"] == "浦发银行"
-
-
-def test_account_detail_without_market_data(tmp_path):
-    """无行情时 last_price/pnl_pct 为 null, 名称回退为代码, 不报错。"""
-    store = _seed(tmp_path)
-    manual_trade("acc1", ManualTradeModel(symbol="600000.SH", side="buy",
-                                          qty=100, price=10.0), None)
-
-    class _NoDataMarket:
-        def latest_date(self):
-            return None
-
-        def day_rows(self, date, signal_ids=None):
-            return {}
-
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
-        store=store, repo=_FakeRepo())))
-    context.set_instances(store, _NoDataMarket(), None)
-    detail = account_detail("acc1", request)
-    pos = detail["positions"][0]
-    assert pos["last_price"] is None and pos["pnl_pct"] is None
-    assert pos["name"] == "浦发银行"
+    client.post("/api/paper/account", json={"initial_cash": 1000000, "name": "甲"})
+    client.post("/api/paper/account", json={"initial_cash": 500000, "account_id": "acc_b", "name": "乙"})
+    rows = client.get("/api/paper/compare").json()["accounts"]
+    assert [r["account"] for r in rows] == ["default", "acc_b"]
+    row = rows[0]
+    assert row["name"] == "甲" and row["initial_cash"] == 1000000
+    assert row["total"] == pytest.approx(1000000)
+    assert row["pnl_pct"] == 0.0
+    assert row["fees"]["commission_pct"] == pytest.approx(0.00025)
+    assert row["rounds"] == 0 and row["win_rate"] == 0.0
+    assert row["nav"] == []  # 尚无定版净值
+    # 字段完整性 (对比表依赖)
+    for key in ("cash", "market_value", "total_pnl", "profit_loss_ratio", "max_drawdown", "avg_holding_days", "realized_pnl"):
+        assert key in row
