@@ -107,7 +107,8 @@ class FakeMarket:
         self.rows = rows
         self.limit_up = {}
 
-    def day_rows(self, date, signal_ids=None):
+    def day_rows(self, date, signal_ids=None, force_refresh=False):
+        # force_refresh 仅为对齐 MarketData 接口: 假行情无缓存, 无差别返回
         return self.rows.get(date, {})
 
     def symbol_limit_up(self, symbol):

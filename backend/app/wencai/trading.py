@@ -487,7 +487,11 @@ def process_day(market: MarketData, account: Account, strategy: PaperStrategy,
     iwencai_rows: 当日问财快照的归一化字段（{symbol: {field: value}}），供买入字段条件判定。
     问财候选/字段与行情的代码格式差异在此统一（见 _align_symbol_keys）。
     """
-    rows = market.day_rows(date, strategy_signal_ids(strategy))
+    # 结算必须绕过内存缓存: 当日分区在盘中(集合竞价 09:25-09:30)被读到过
+    # high/low 为 close 兜底值的伪快照, 且空 signal_ids 策略的缓存键与
+    # api.py 的 day_rows(latest) 相同, 命中它会让 buyable_at_open 的
+    # "最高=最低"一字板判定对全市场成立, 候选被全部跳过(2026-09-30 事故)。
+    rows = market.day_rows(date, strategy_signal_ids(strategy), force_refresh=True)
     candidates, iwencai_rows = _align_symbol_keys(rows, candidates, iwencai_rows)
 
     trades: list[TradeRecord] = []

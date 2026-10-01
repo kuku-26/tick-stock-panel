@@ -80,19 +80,32 @@ class MarketData:
 
     # ── enriched 日线 ─────────────────────────────────
     def day_rows(self, date: str,
-                 signal_ids: set[str] | None = None) -> dict[str, DayRow]:
+                 signal_ids: set[str] | None = None,
+                 force_refresh: bool = False,
+                 cache: bool = True) -> dict[str, DayRow]:
         """读取指定交易日的行情行(含信号), 返回 {symbol: DayRow}。
 
         enriched 分区不含指标/信号列, 因此读取 date 及其前 _DAY_ROWS_LOOKBACK
         个交易日的原始数据, 复用 indicators 管线按需计算 signal_ids 对应的
         csg_* 信号列后取当日行。结果按 (date, signal_ids) 缓存。
+
+        force_refresh=True 跳过缓存、强制重读分区并覆盖缓存。当日分区在盘中会被
+        增量写入器反复重写, 集合竞价阶段(09:25-09:30)读到的是 high/low 被 close
+        兜底填充的"全市场一字板"伪快照; 盘后结算必须绕过这份脏缓存(见
+        trading.process_day 结算入口)。
+
+        cache=False 只读不写: 本次读取仍会重算并返回结果, 但不落进 _rows_cache,
+        因此不会把未定盘的当日分区固化给后续调用方(见 api.account_detail 的
+        持仓现价兜底读取——它只在竞价窗口被前端轮询触发, 缓存它正是 2026-09-30
+        结算读到伪快照的污染源)。
         """
         sig_key = tuple(sorted(signal_ids or ()))
         cache_key = (date, sig_key)
-        if cache_key in self._rows_cache:
+        if not force_refresh and cache_key in self._rows_cache:
             return self._rows_cache[cache_key]
         rows = self._compute_day_rows(date, set(sig_key))
-        self._rows_cache[cache_key] = rows
+        if cache:
+            self._rows_cache[cache_key] = rows
         return rows
 
     def _compute_day_rows(self, date: str, signal_ids: set[str]) -> dict[str, DayRow]:

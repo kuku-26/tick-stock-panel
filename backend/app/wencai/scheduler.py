@@ -7,6 +7,10 @@
 simulate_time 建议不早于盘后管道完成时间; 行情未就绪时本次结算跳过,
 不自动重试。
 
+两个任务出勤前先经交易日探针 (app.services.trading_day): 工作日但休市
+(国庆等法定节假日)直接跳过, 避免节假日写入基于上一交易日的假名单。
+探针未知(None)时维持原行为照常执行。
+
 调度失败只记录日志，绝不破坏主程序；单个策略故障不影响其它策略。
 """
 from __future__ import annotations
@@ -15,6 +19,8 @@ import logging
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+
+from app.services import trading_day
 
 from . import context
 from .market import MarketData
@@ -26,8 +32,20 @@ logger = logging.getLogger(__name__)
 TZ = "Asia/Shanghai"
 
 
+def _is_holiday() -> bool:
+    """工作日但休市(国庆等法定节假日)。探针未知(None)时按交易日处理, 维持原行为。"""
+    try:
+        return trading_day.is_trading_day() is False
+    except Exception as e:  # noqa: BLE001 — 探针异常不阻断例行任务
+        logger.warning("wencai 交易日探针失败, 按交易日继续: %s", e)
+        return False
+
+
 def _fetch(strategy_id: str) -> None:
     try:
+        if _is_holiday():
+            logger.info("wencai fetch %s: 今日非交易日(节假日), 跳过", strategy_id)
+            return
         store = context.get_store()
         strategy = store.load_strategies().get(strategy_id)
         if strategy is None or not strategy.enabled:
@@ -40,8 +58,15 @@ def _fetch(strategy_id: str) -> None:
 
 
 def _simulate(strategy_id: str, date_str: str | None = None) -> None:
-    """结算一个策略; 行情未就绪时记录告警并跳过本次结算(不重试)。"""
+    """结算一个策略; 行情未就绪时记录告警并跳过本次结算(不重试)。
+
+    date_str 为空即例行结算(当日), 需先过交易日探针; 显式指定日期
+    (手动/补跑)不受「今日是否交易日」门控。
+    """
     try:
+        if date_str is None and _is_holiday():
+            logger.info("wencai simulate %s: 今日非交易日(节假日), 跳过", strategy_id)
+            return
         store = context.get_store()
         strategy = store.load_strategies().get(strategy_id)
         if strategy is None or not strategy.enabled:

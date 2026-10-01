@@ -636,8 +636,11 @@ def account_detail(account_id: str, request: Request):
             except Exception:
                 pass
         try:
+            # 只读不写缓存: 该兜底读取只在盘中(含 09:25-09:30 集合竞价)被前端
+            # 轮询触发, 此时当日分区 high/low 尚未定盘; 缓存它会把伪快照固化,
+            # 让盘后结算读到"全市场一字板"而跳过全部买入(2026-09-30 事故)。
             latest = _market(request).latest_date()
-            rows = _market(request).day_rows(latest) if latest else {}
+            rows = _market(request).day_rows(latest, cache=False) if latest else {}
             for s in symbols:
                 if last_price.get(s) is None and rows.get(s) is not None:
                     last_price[s] = rows[s].close
