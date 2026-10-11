@@ -67,16 +67,13 @@ hiddenimports += collect_submodules("polars")
 # entry 又是 importlib 字符串动态导入 — 两条链路静态分析都看不见, 必须双声明:
 # datas 把清单 yaml 落盘 (frozen 下 plugins_dir() 恰好解析到 _internal/app/plugins),
 # hiddenimports 把 provider/client 塞进 PYZ。
-# 注: stocksdk 出于合规暂不进桌面包 (与 GHCR 镜像口径一致), 需要时仿照添加。
+# 注: 其他内置插件如需进桌面包, 仿照 fuyao 双声明添加。
 datas += [
     (str(ROOT / "backend" / "app" / "plugins" / "fuyao" / "plugin.yaml"), "app/plugins/fuyao"),
-    (str(ROOT / "backend" / "app" / "plugins" / "amber" / "plugin.yaml"), "app/plugins/amber"),
 ]
 hiddenimports += [
     "app.plugins.fuyao.provider",
     "app.plugins.fuyao.client",
-    "app.plugins.amber.provider",
-    "app.plugins.amber.client",
 ]
 
 # ── 后端源码扩展 (app/custom/*) ──────────────────────────────────────
